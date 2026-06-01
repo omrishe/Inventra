@@ -1,0 +1,187 @@
+# MVP Implementation Plan: Multi-Tenant Smart Inventory System (SaaS)
+
+This document defines the scoped MVP (Minimum Viable Product) implementation plan for **Inventra**, based on the master [Implementation Plan](implementation_plan.md). It outlines the exact sequential steps and sub-steps required to build a functional, secure, and testable slice of the application.
+
+---
+
+## 🎯 1. MVP Scope Definition
+
+To deliver a working system efficiently, the scope is focused on core value: tenancy isolation, stock tracking with concurrency protection, and catalog management.
+
+### 🟩 In Scope (MVP)
+* **Store-Chain Tenancy Model:** Logical isolation using EF Core Global Query Filters (`ChainId`).
+* **Authentication & Static RBAC:** JWT authentication (15 min) + token refresh (7 days, Data Protection API). Roles are static enums (`ChainAdmin`, `StoreManager`, `StoreEmployee`) with hardcoded permission lists.
+* **Product Catalog:** TPT (Table-Per-Type) polymorphism supporting **Physical** and **Perishable** products (Digital products deferred).
+* **Inventory Tracking:** Store-level stock counts with `StockMovements` ledger.
+* **Basic Reservations:** Active reservations check, optimistic concurrency control (`xmin` row version), and a simplified cleanup query for expired reservations.
+* **Frontend SPA (React/Vite):** Core dashboard, login/registration, product view, and stock level adjustment forms.
+
+### 🟥 Out of Scope (Deferred)
+* **Dynamic RBAC Editor:** Database tables for dynamic roles and UI to create/manage custom permissions (uses static configuration for now).
+* **Digital Products:** Specialized download URLs and license keys.
+* **Full Procurement Pipeline:** Suppliers list, Purchase Orders placement, and PO receipt flows (stock is added via manual adjustments/receipts instead).
+* **Redis Cache Integration:** Local in-memory caching is used; distributed token invalidation is deferred.
+* **Database-Native pg_cron Scheduling:** Deferred in favor of a cross-platform dotnet-native background worker.
+
+---
+
+## 🛠️ 2. Step-by-Step MVP Build Order
+
+This section provides the sequential checklist for building the backend and frontend components. Each phase builds upon the previous one.
+
+```mermaid
+graph TD
+    P1[Phase 1: Boilerplate & Tenancy] --> P2[Phase 2: Authentication]
+    P2 --> P3[Phase 3: Product Catalog]
+    P3 --> P4[Phase 4: Stock & Concurrency]
+    P4 --> P5[Phase 5: Frontend UI]
+```
+
+---
+
+### 📦 Phase 1: Core Setup & Tenancy Infrastructure
+
+The objective of this phase is to establish the Clean Architecture solution and implement the automatic data isolation boundaries.
+
+#### **Step 1.1: WebAPI & Clean Architecture Project Setup**
+1. Create the parent directories `backend/` and `frontend/` in the workspace root.
+2. Initialize the dotnet solution inside the `backend/` directory: `dotnet new sln -n Inventra`.
+3. Create the 4 Clean Architecture projects:
+   * `Inventra.Domain` (Class Library): Holds base entities, exceptions, and enums.
+   * `Inventra.Application` (Class Library): Houses services, DTOs, interfaces, and validators.
+   * `Inventra.Infrastructure` (Class Library): Holds `AppDbContext`, migrations, and security implementations.
+   * `Inventra.API` (Web API): Holds controllers, middlewares, and configuration.
+4. Link projects to the solution and establish references:
+   * `API` -> `Application` & `Infrastructure`
+   * `Infrastructure` -> `Application`
+   * `Application` -> `Domain`
+5. Install packages: `Npgsql.EntityFrameworkCore.PostgreSQL`, `BCrypt.Net-Next`, `Microsoft.AspNetCore.Authentication.JwtBearer`, `Microsoft.AspNetCore.DataProtection`.
+
+#### **Step 1.2: Tenant Isolation & DbContext Configuration**
+1. Define the `ITenantEntity` interface in the Domain layer containing `Guid ChainId`.
+2. Define the core tenant entities: `Chain` (ID, Name, PlanType) and `Store` (ID, ChainId, Name, Location).
+3. Implement `AppDbContext` and wire the `OnModelCreating` configuration:
+   * Automatically apply a Global Query Filter to all entities implementing `ITenantEntity` using the active `ChainId` from `ITenantContext`.
+   * Configure the PostgreSQL `xmin` system column to act as a concurrency token for the `InventoryItem` entity.
+4. Generate the initial EF Core migration: `dotnet ef migrations add InitialMigration`.
+
+#### **Step 1.3: Tenancy Context Extraction Middleware**
+1. Create `ITenantContext` (scoped) to hold the current request's `ChainId` and optional `StoreId`.
+2. Create `TenantMiddleware` in the API layer:
+   * Read the token claims (`ChainId`, `StoreId`).
+   * Inject these values into `ITenantContext`.
+   * Handle unauthenticated paths (e.g., Login/Register) by bypassing extraction.
+
+---
+
+### 🔐 Phase 2: Authentication & Static RBAC
+
+The objective of this phase is to secure the API and implement the claims-based authorization framework.
+
+#### **Step 2.1: Password Hashing & Static Permission Definitions**
+1. Implement password hashing using `BCrypt` in a service (`PasswordHasher`).
+2. Define permissions as static string constants (`products:read`, `products:write`, `inventory:read`, `inventory:write`, `inventory:adjust`).
+3. Define roles (`ChainAdmin`, `StoreManager`, `StoreEmployee`) and map them to their respective static permission lists in code.
+
+#### **Step 2.2: Login, Registration & JWT Generation**
+1. Create the `AuthService`:
+   * `RegisterCompany`: Creates a `Chain` and the initial admin `User` inside an EF Core transaction.
+   * `Login`: Verifies the email and password, resolves the effective static permissions, and issues a 15-minute JWT.
+2. Embed the user's `ChainId`, `StoreId`, and deduplicated permissions array as claims in the JWT.
+3. Build the custom authorization attribute `[HasPermission(string permission)]` and action filter to block unauthorized requests with a `403 Forbidden` response.
+
+#### **Step 2.3: Refresh Token Flow (Data Protection API)**
+1. Define the `RefreshToken` entity (Id, UserId, TokenHash, ExpiresAt, IsRevoked).
+2. Use the ASP.NET Core Data Protection API (`IDataProtector`) to encrypt and sign the user payload as a secure opaque string returned to the client.
+3. Hash the token using SHA-256 before saving to the database.
+4. Implement `POST /api/v1/auth/refresh` to validate the token, perform rotation (revoke old, issue new), and return a fresh JWT.
+
+---
+
+### 📦 Phase 3: Product Catalog & Stores
+
+The objective of this phase is to build the metadata APIs for stores and product structures.
+
+#### **Step 3.1: Stores Management API**
+1. Implement `StoreService` (CreateStore, GetStores).
+2. Expose `POST /api/v1/stores` and `GET /api/v1/stores` endpoints.
+3. Validate that `Store` creation is restricted to users with `stores:write` (ChainAdmin).
+
+#### **Step 3.2: TPT Polymorphic Products API**
+1. Define the `Product` entity (base) and TPT sub-types:
+   * `PhysicalProduct` (Weight, Dimensions)
+   * `PerishableProduct` (StorageTemperature)
+2. Implement `ProductService.CreateProduct` to map polymorphic requests into the correct entities.
+3. Implement `GET /api/v1/products` with filters (search name/SKU, product type). Ensure the global query filter restricts results to the user's `ChainId`.
+
+---
+
+### 📊 Phase 4: Stock Tracking, Adjustments & Reservations
+
+The objective of this phase is to build the core inventory engine, protect against race conditions, and implement transaction-safe stock changes.
+
+#### **Step 4.1: Stock Management & Movements Ledger**
+1. Create the `InventoryItem` entity (StoreId, ProductId, Quantity).
+2. Create the `StockMovement` ledger entity (StoreId, ProductId, Type [IN/OUT/ADJUSTMENT], Quantity, Reason, CreatedBy).
+3. Create `InventoryService` with:
+   * `AdjustStock`: Atomically updates physical quantities and writes an audit record in `StockMovements`.
+   * `GetInventoryLevels`: Returns the physical, reserved, and available quantity for each product.
+4. Expose `GET /api/v1/inventory` and `POST /api/v1/inventory/adjust` (restricted to `inventory:adjust`).
+
+#### **Step 4.2: Reservation Engine & Concurrency Control**
+1. Create the `Reservation` entity (StoreId, ProductId, Quantity, Status [Pending/Completed/Expired], ExpiresAt).
+2. Implement a dynamic calculation in `ReservationService` to verify available stock:
+   $$\text{Available Stock} = \text{InventoryItem.Quantity} - \sum \text{Active Reservations}$$
+3. Implement `POST /api/v1/inventory/reserve` wrapping the operation in an EF Core transaction:
+   * Retrieve physical stock and calculate available quantity.
+   * If stock is sufficient, save a `Pending` reservation with a strict lifetime limit.
+   * Catch `DbUpdateConcurrencyException` (triggered if another thread updated the `xmin` row version), and automatically retry up to 3 times before returning a `409 Conflict`.
+
+#### **Step 4.3: Expired Reservations Cleanup**
+1. Implement a dotnet background worker (`BackgroundService`) in the WebAPI project configured to trigger every 60 seconds.
+2. Under a scoped lifetime scope, resolve `AppDbContext` and execute a SQL command to update pending expired reservations:
+   `UPDATE "Reservations" SET "Status" = 'Expired' WHERE "Status" = 'Pending' AND "ExpiresAt" < UTC_NOW`.
+
+---
+
+### 💻 Phase 5: Frontend MVP (React + Vite + Zustand)
+
+The objective of this phase is to construct the user interface and integrate it with the backend API.
+
+#### **Step 5.1: Scaffold & Layout Setup**
+1. Initialize the frontend using Vite + React + TypeScript inside the `frontend/` directory.
+2. Configure basic CSS variables for colors, spacing, and typography (supporting light/dark modes).
+3. Create the Axios `apiClient` configured with automatic bearer token injection and a response interceptor for token refresh.
+4. Set up React Router v6 and create the layout with a Sidebar (navigation) and Topbar (user info & store selection).
+
+#### **Step 5.2: Auth Shell & Guards**
+1. Create the `AuthContext` and Zustand store for managing login state, JWT, and user permissions.
+2. Build the `Login` and `RegisterCompany` pages.
+3. Build the `RouteGuard` component to wrap protected routes, checking roles/permissions and redirecting unauthorized users.
+
+#### **Step 5.3: Pages & Forms**
+1. **Dashboard Page:** Displays key stats (total items, low-stock alerts).
+2. **Product Catalog Page:** Table view listing products, with a modal form to create a product (allowing Physical/Perishable type selection).
+3. **Inventory Management Page:** List view showing physical, reserved, and available stock levels, plus a form/modal to submit stock adjustments.
+
+---
+
+## 🧪 3. MVP Testing Checklist
+
+Before completing the MVP, the following behavior must be verified:
+
+1. **Isolation Test:** Creating a product in Tenant A must *never* make it visible when querying as Tenant B.
+2. **Scoping Test:** A user scoped to Store A must *never* be able to view inventory levels or submit adjustments for Store B.
+3. **Concurrency Test:** Simulating 10 parallel requests to reserve the same 1 remaining unit of stock must result in exactly 1 success and 9 failures (or retries resulting in clean stock-out responses).
+4. **Token Rotation Test:** Reusing an old refresh token must result in rejection, and logouts must invalidate refresh tokens immediately.
+
+---
+
+## 📝 4. Confirmed MVP Architecture & Design Choices
+
+The following decisions have been finalized and are locked in for the development phase:
+
+1. **Static Roles & Permissions:** Dynamic RBAC tables and dynamic role management UI are deferred. Static roles (`ChainAdmin`, `StoreManager`, `StoreEmployee`) are implemented in code with pre-defined permission scopes.
+2. **Physical & Perishable Focus:** Digital products are deferred; polymorphic schema and CRUD operations support base Product, Physical, and Perishable types only.
+3. **Direct Stock Adjustments:** Suppliers registry and Purchase Order workflows are deferred. Initial stock counts and edits are managed through direct adjustments.
+4. **Dotnet-Native Background Service:** A dotnet `BackgroundService` is selected over database-specific `pg_cron` dependencies to keep the application host-agnostic. It runs a scheduled task every 60 seconds to update expired reservation records.
