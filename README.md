@@ -110,11 +110,13 @@ erDiagram
 
 ### 💻 Frontend Client (SPA)
 
-- **Build Tool & Library:** Vite + React (TypeScript)
-- **State Management:** Zustand (Client-side UI states) + TanStack Query / React Query (Server-side cache and query state)
-- **Routing:** React Router v6 (using custom `RouteGuard` wrapper components for permission checks)
-- **API Client:** Axios (featuring automatic authorization headers, token expiration interceptors, and requests queuing during token refreshes)
-- **Styling:** Native CSS with CSS Modules
+- **Build Tool & Library:** Vite + React
+- **Language:** TypeScript (enforces strict compile-time type-safety and maps to backend DTO contract definitions)
+- **Server State Management:** TanStack Query v5 (React Query) (manages declarative fetching, automated caching, background updates, and automatic cache invalidation using query key tracking)
+- **Client UI State:** Zustand (provides lightweight, boilerplate-free state management for local UI states like sidebar toggles and store branch selections)
+- **Routing & RBAC:** React Router v6 (wrapped in custom, permission-aware `RouteGuard` components checking user claims on navigation)
+- **API Client:** Axios (features auto-injecting bearer headers and custom response interceptors to handle seamless refresh token rotation)
+- **Styling:** Native CSS (structured via CSS Modules for scoped styling and parameterized with HSL color variables for dark mode support)
 
 ---
 

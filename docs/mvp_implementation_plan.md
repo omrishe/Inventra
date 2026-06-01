@@ -144,29 +144,107 @@ The objective of this phase is to build the core inventory engine, protect again
 
 ---
 
-### 💻 Phase 5: Frontend MVP (React + Vite + Zustand)
+### 💻 Phase 5: Frontend MVP (React + Vite + TypeScript + TanStack Query + Zustand)
 
-The objective of this phase is to construct the user interface and integrate it with the backend API.
+The objective of this phase is to construct the user interface and integrate it with the backend API using a modern, type-safe frontend stack.
 
 #### **Step 5.1: Scaffold & Layout Setup**
-1. Initialize the frontend using Vite + React + TypeScript inside the `frontend/` directory.
-2. Configure basic CSS variables for colors, spacing, and typography (supporting light/dark modes).
-3. Create the Axios `apiClient` configured with automatic bearer token injection and a response interceptor for token refresh.
-4. Set up React Router v6 and create the layout with a Sidebar (navigation) and Topbar (user info & store selection).
+1. Initialize the frontend using Vite + React + TypeScript inside the `frontend/` directory: `npx -y create-vite@latest frontend --template react-ts`.
+2. Install frontend dependencies: `npm install @tanstack/react-query zustand axios react-router-dom`.
+3. Set up the `QueryClient` and `QueryClientProvider` at the application root (`main.tsx`).
+4. Configure vanilla CSS variables for colors, typography, and spacing (supporting light/dark themes).
+5. Define TypeScript interfaces matching the backend API DTOs (e.g., `UserDto`, `ChainDto`, `StoreDto`, `ProductDto`, `InventoryItemDto`) in `src/types/index.ts`.
+6. Create the Axios `apiClient` configured with automatic bearer token injection and a response interceptor for token refresh.
+7. Set up React Router v6 and create the layout with a Sidebar (navigation) and Topbar (user info & store selection).
 
 #### **Step 5.2: Auth Shell & Guards**
-1. Create the `AuthContext` and Zustand store for managing login state, JWT, and user permissions.
-2. Build the `Login` and `RegisterCompany` pages.
-3. Build the `RouteGuard` component to wrap protected routes, checking roles/permissions and redirecting unauthorized users.
+1. Create a Zustand store (`useAuthStore`) to manage user login state, the JWT, and resolved user permissions.
+2. Build the `Login` and `RegisterCompany` pages using React state and TanStack Query mutations (`useMutation`) for API calls.
+3. Build the `RouteGuard` component to wrap protected routes, checking permissions from the Zustand store and redirecting unauthorized users.
 
 #### **Step 5.3: Pages & Forms**
-1. **Dashboard Page:** Displays key stats (total items, low-stock alerts).
-2. **Product Catalog Page:** Table view listing products, with a modal form to create a product (allowing Physical/Perishable type selection).
-3. **Inventory Management Page:** List view showing physical, reserved, and available stock levels, plus a form/modal to submit stock adjustments.
+1. **Dashboard Page:** Displays key stats (total items, low-stock alerts) fetched via TanStack Query `useQuery`.
+2. **Product Catalog Page:** Table view listing products (fetched via `useQuery`), with a modal form to create a product (allowing Physical/Perishable type selection) handled via `useMutation` with automatic query invalidation.
+3. **Inventory Management Page:** List view showing physical, reserved, and available stock levels (fetched via `useQuery` scoped to the selected store), plus a form/modal to submit stock adjustments handled via `useMutation`.
 
 ---
 
-## 🧪 3. MVP Testing Checklist
+## 🎨 3. Frontend Architecture & Stack
+
+### Technical Stack Overview
+The frontend is built as a single-page application (SPA) optimized for speed, developer velocity, and type safety:
+* **Build Tool:** Vite (for fast HMR and optimized production builds)
+* **Language:** TypeScript (strict type checking enabled to prevent runtime errors)
+* **Router:** React Router v6 (for declarative routing and layouts)
+* **Server State:** TanStack Query v5 (React Query) (for caching, background updates, loading/error state management)
+* **Client UI State:** Zustand (for lightweight, reactive, global client state)
+* **Styling:** Vanilla CSS (CSS Variables + CSS Modules for encapsulation)
+
+### TypeScript Type-Safety Guidelines
+* **Zero `any` Policy:** All API responses, request payloads, and component props must be explicitly typed.
+* **Shared API Contracts:** Define matching TypeScript types/interfaces for all backend DTOs inside `src/types/index.ts`.
+* **Component Props:** Always type props using interfaces, avoiding inline type annotations.
+
+### Server State (TanStack Query v5)
+* **Caching & Invalidation:** All GET requests use `useQuery`. Write operations (POST/PATCH/DELETE) use `useMutation`.
+* **Cache Invalidation:** Always call `queryClient.invalidateQueries` inside mutation `onSuccess` hooks to trigger automatic refetches.
+* **Example TanStack Query Hook Pattern:**
+  ```typescript
+  import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+  import { fetchProducts, createProduct } from '../services/api/productService';
+  import { ProductDto, CreateProductRequest } from '../types';
+
+  export const useProducts = () => {
+    const queryClient = useQueryClient();
+
+    const productsQuery = useQuery<ProductDto[]>({
+      queryKey: ['products'],
+      queryFn: fetchProducts,
+    });
+
+    const createProductMutation = useMutation({
+      mutationFn: (newProduct: CreateProductRequest) => createProduct(newProduct),
+      onSuccess: () => {
+        // Automatically refresh catalog on successful creation
+        queryClient.invalidateQueries({ queryKey: ['products'] });
+      },
+    });
+
+    return {
+      products: productsQuery.data ?? [],
+      isLoading: productsQuery.isLoading,
+      isError: productsQuery.isError,
+      createProduct: createProductMutation.mutate,
+      isCreating: createProductMutation.isPending,
+    };
+  };
+  ```
+
+### Client UI State (Zustand)
+* **Purpose:** Zustand is dedicated strictly to client-only state that does not come from a database (e.g., UI toggles, local preferences, store selection, auth status).
+* **Example Auth and UI Store:**
+  ```typescript
+  import { create } from 'zustand';
+  import { UserDto } from '../types';
+
+  interface AuthState {
+    user: UserDto | null;
+    token: string | null;
+    setAuth: (user: UserDto, token: string) => void;
+    clearAuth: () => void;
+  }
+
+  export const useAuthStore = create<AuthState>((set) => ({
+    user: null,
+    token: null,
+    setAuth: (user, token) => set({ user, token }),
+    clearAuth: () => set({ user: null, token: null }),
+  }));
+  ```
+
+---
+
+## 🧪 4. MVP Testing Checklist
 
 Before completing the MVP, the following behavior must be verified:
 
@@ -177,7 +255,7 @@ Before completing the MVP, the following behavior must be verified:
 
 ---
 
-## 📝 4. Confirmed MVP Architecture & Design Choices
+## 📝 5. Confirmed MVP Architecture & Design Choices
 
 The following decisions have been finalized and are locked in for the development phase:
 

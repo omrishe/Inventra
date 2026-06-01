@@ -772,12 +772,12 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ## 🎨 5. Frontend Architecture (React + Vite)
 
 ### Technical Stack
-* **Build Tool:** Vite
-* **Language:** TypeScript
-* **Router:** React Router v6
-* **Server State:** TanStack Query (React Query)
-* **Client UI State:** Zustand
-* **Styling:** Native CSS (using standard CSS modules for scope isolation)
+* **Build Tool:** Vite (for fast HMR and highly optimized production builds)
+* **Language:** TypeScript (strict type checking enabled to prevent runtime errors and share DTO interfaces)
+* **Router:** React Router v6 (for client-side routing, nested layouts, and route guards)
+* **Server State:** TanStack Query v5 (React Query) (for caching, query invalidation, background synchronization, and request lifecycle management)
+* **Client UI State:** Zustand (for lightweight, zero-boilerplate global UI state management)
+* **Styling:** Native CSS (using standard CSS modules for scope isolation and HSL variable-based themes)
 
 ### Folder Structure
 We will organize the project in the workspace root with two main folders: `backend/` and `frontend/`. The frontend project is structured as follows:
@@ -839,23 +839,68 @@ frontend/
 │   │       ├── Layout.module.css
 │   │       └── Card.module.css
 │   ├── types/
-│   │   └── index.ts
+│   │   └── index.ts            -- Central repository for strict TypeScript interface definitions
 │   ├── App.tsx
 │   └── main.tsx
 ├── package.json
 └── tsconfig.json
 ```
 
+### TypeScript Integration Guidelines
+
+To guarantee full type safety across the client-server boundary, the frontend implements the following TypeScript practices:
+1. **Strict Type Safety:** `noImplicitAny` and `strictNullChecks` are enabled in `tsconfig.json`.
+2. **DTO & Domain Models:** All request payloads and response bodies have dedicated TypeScript interfaces matching the backend models (e.g. `ProductDto`, `StockMovementDto`, `RegisterCompanyRequest`).
+3. **Generics in API Requests:** Axios client calls and TanStack Query hooks utilize these interfaces to ensure compile-time verification of properties.
+
 ### State Management Strategy
 
-#### 1. Server State (React Query)
-Used for all remote database interactions (fetching products, inventory lists, POs). Ensures automatic caching, stale-while-revalidate, and simplified loading/error states.
-Example queries:
-* `useQuery(['products'], fetchProducts)`
-* `useMutation(createProduct, { onSuccess: () => queryClient.invalidateQueries('products') })`
+#### 1. Server State (TanStack Query v5)
+Used for all asynchronous operations communicating with the backend database. TanStack Query isolates caching logic, background synchronization, and automatic loading/error indicators.
+
+* **Query Keys:** Structured as hierarchical arrays for clean invalidation: `['products']`, `['products', productId]`, `['inventory', storeId]`.
+* **v5 Syntax:** Queries and mutations use object parameters instead of deprecated positional arguments.
+
+##### **Example: Custom Hook for Product Management**
+```typescript
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { fetchProducts, createProduct } from '../services/api/productService';
+import { ProductDto, CreateProductRequest } from '../types';
+
+export const useProducts = () => {
+  const queryClient = useQueryClient();
+
+  // Query catalog using object arguments (v5 standard)
+  const productsQuery = useQuery<ProductDto[], Error>({
+    queryKey: ['products'],
+    queryFn: fetchProducts,
+    staleTime: 5 * 60 * 1000, // Cache valid for 5 minutes
+  });
+
+  // Mutation for creating a new product with cache invalidation on success
+  const createProductMutation = useMutation<ProductDto, Error, CreateProductRequest>({
+    mutationFn: (newProduct) => createProduct(newProduct),
+    onSuccess: () => {
+      // Invalidate products query cache to trigger automatic background refetch
+      queryClient.invalidateQueries({ queryKey: ['products'] });
+    },
+  });
+
+  return {
+    products: productsQuery.data ?? [],
+    isLoading: productsQuery.isLoading,
+    isError: productsQuery.isError,
+    error: productsQuery.error,
+    createProduct: createProductMutation.mutateAsync,
+    isCreating: createProductMutation.isPending,
+  };
+};
+```
 
 #### 2. Local State (Zustand)
-Used for lightweight local UI control state that needs to survive across unrelated components.
+Used exclusively for transient, client-only UI state that must survive across separate component trees (e.g., sidebar collapse toggles, selected store views, active modal visibility).
+
+##### **Example: UI Configuration Store**
 ```typescript
 import { create } from 'zustand';
 
@@ -876,7 +921,12 @@ export const useUIStore = create<UIState>((set) => ({
 
 ### Route-Level RBAC Protection
 We wrap components using a `RouteGuard` to check user permissions dynamically before loading pages.
+
 ```tsx
+import React from 'react';
+import { Navigate } from 'react-router-dom';
+import { useAuth } from '../hooks/useAuth';
+
 interface RouteGuardProps {
   requiredPermission?: string;
   children: React.ReactNode;
@@ -889,6 +939,7 @@ export const RouteGuard: React.FC<RouteGuardProps> = ({ requiredPermission, chil
     return <Navigate to="/login" replace />;
   }
 
+  // Allow access if user holds required permission or wildcard '*' super-admin permission
   if (requiredPermission && !user?.permissions.includes(requiredPermission) && !user?.permissions.includes('*')) {
     return <Navigate to="/unauthorized" replace />;
   }
