@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Inventra.API/Inventra.API.csproj" />
+    <Project Path="src/Inventra.Application/Inventra.Application.csproj" />
+    <Project Path="src/Inventra.Domain/Inventra.Domain.csproj" />
+    <Project Path="src/Inventra.Infrastructure/Inventra.Infrastructure.csproj" />
+  </Folder>
+</Solution>
