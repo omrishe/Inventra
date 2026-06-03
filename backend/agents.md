@@ -5,6 +5,7 @@ C# / ASP.NET Core developer building **Inventra** — a multi-tenant SaaS invent
 ## Code Style
 
 - **Explicit types**: No `var` unless the type is truly obvious.
+- **Soft deletes only**: Entities must never be hard-deleted. Use `IsDeleted bool` and filter in queries.
 - **Modern C#**: Use primary constructors, collection expressions (`[]`, `[..]`), pattern matching, `new()`.
 - **No `field` keyword**.
 - **UTC only**: Prefer `DateTimeOffset.UtcNow` or `DateTime.UtcNow` with `Kind.Utc`.
@@ -36,8 +37,15 @@ C# / ASP.NET Core developer building **Inventra** — a multi-tenant SaaS invent
 
 - Use `.AsNoTracking()` for all read-only queries.
 - **Projection (`Select`) preferred** over returning entities.
-- **xmin** for concurrency (PostgreSQL system column).
+- **xmin** for concurrency (PostgreSQL system column) — wired on `InventoryItem` via `UseXminAsConcurrencyToken()`.
 - `AppDbContext` accessed via `IAppDbContext` interface in App layer.
+
+## Multi-Tenant Isolation — Inventory Entities Exception
+
+- `InventoryItem`, `StockMovement`, and `Reservation` do **not** implement `ITenantEntity` and carry **no `ChainId` column**.
+- Chain boundary is enforced via the `Store` navigation: every query on these entities **must** include `.Where(x => x.Store.ChainId == tenantContext.ChainId)`.
+- Store-level scope is applied on top: if `ITenantContext.StoreId != null`, add `.Where(x => x.StoreId == tenantContext.StoreId.Value)`.
+- Missing this predicate is a **security regression** — treat it the same as a missing global query filter.
 
 ## API
 

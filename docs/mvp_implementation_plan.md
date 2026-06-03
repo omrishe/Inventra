@@ -121,26 +121,28 @@ The objective of this phase is to build the metadata APIs for stores and product
 The objective of this phase is to build the core inventory engine, protect against race conditions, and implement transaction-safe stock changes.
 
 #### **Step 4.1: Stock Management & Movements Ledger**
-1. Create the `InventoryItem` entity (StoreId, ProductId, Quantity).
-2. Create the `StockMovement` ledger entity (StoreId, ProductId, Type [IN/OUT/ADJUSTMENT], Quantity, Reason, CreatedBy).
-3. Create `InventoryService` with:
-   * `AdjustStock`: Atomically updates physical quantities and writes an audit record in `StockMovements`.
-   * `GetInventoryLevels`: Returns the physical, reserved, and available quantity for each product.
-4. Expose `GET /api/v1/inventory` and `POST /api/v1/inventory/adjust` (restricted to `inventory:adjust`).
+1. Add `IsDeleted bool` to the `User` entity (soft-delete; users are never hard-deleted).
+2. Create the `InventoryItem` entity (`StoreId`, `ProductId`, `Quantity`, `UpdatedAt`). **No `ChainId` column** — chain isolation enforced via `InventoryItem.StoreId → Store.ChainId` join.
+3. Create the `StockMovement` ledger entity (`StoreId`, `ProductId`, `Type` [In/Out/Adjustment], `Quantity`, `Reason`, `CreatedByUserId`).
+4. Create `InventoryService` with:
+   * `AdjustStock`: Verifies the `InventoryItem` exists (returns `404` if not), applies the signed delta, writes a `StockMovement` audit record, and saves atomically.
+   * `GetInventoryLevels`: Filters by `Store.ChainId == tenantContext.ChainId`, then by `StoreId` if the caller is store-scoped. Returns physical, reserved, and available quantity per item.
+5. Expose `GET /api/v1/inventory` (`inventory:read`) and `POST /api/v1/inventory/adjust` (`inventory:adjust`).
 
 #### **Step 4.2: Reservation Engine & Concurrency Control**
-1. Create the `Reservation` entity (StoreId, ProductId, Quantity, Status [Pending/Completed/Expired], ExpiresAt).
-2. Implement a dynamic calculation in `ReservationService` to verify available stock:
+1. Create the `Reservation` entity (`StoreId`, `ProductId`, `Quantity`, `Status` [Pending/Completed/Expired], `ExpiresAt`). **No `ChainId` column** — isolation via `Store.ChainId`.
+2. Implement `ReservationService.CreateReservationAsync`:
    $$\text{Available Stock} = \text{InventoryItem.Quantity} - \sum \text{Active Reservations}$$
 3. Implement `POST /api/v1/inventory/reserve` wrapping the operation in an EF Core transaction:
-   * Retrieve physical stock and calculate available quantity.
-   * If stock is sufficient, save a `Pending` reservation with a strict lifetime limit.
-   * Catch `DbUpdateConcurrencyException` (triggered if another thread updated the `xmin` row version), and automatically retry up to 3 times before returning a `409 Conflict`.
+   * Retrieve `InventoryItem` (tracked, includes `xmin` shadow property) and calculate available quantity.
+   * Caller supplies `LifetimeMinutes`; service caps it at `Inventory:MaxReservationLifetimeMinutes` from config.
+   * If stock is sufficient, **touch** `InventoryItem.UpdatedAt` (triggers the xmin check) and insert a `Pending` reservation.
+   * Catch `DbUpdateConcurrencyException` (xmin mismatch — another thread modified the row) and retry up to 3 times before returning `409 Conflict`.
 
 #### **Step 4.3: Expired Reservations Cleanup**
-1. Implement a dotnet background worker (`BackgroundService`) in the WebAPI project configured to trigger every 60 seconds.
-2. Under a scoped lifetime scope, resolve `AppDbContext` and execute a SQL command to update pending expired reservations:
-   `UPDATE "Reservations" SET "Status" = 'Expired' WHERE "Status" = 'Pending' AND "ExpiresAt" < UTC_NOW`.
+1. Implement a `BackgroundService` (`ReservationCleanupWorker`) in the WebAPI project — triggers every 60 seconds.
+2. Under a scoped lifetime, resolve `AppDbContext` and execute a parameterized SQL command:
+   `UPDATE "Reservations" SET "Status" = 'Expired' WHERE "Status" = 'Pending' AND "ExpiresAt" < {utcNow}`.
 
 ---
 

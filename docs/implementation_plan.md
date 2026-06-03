@@ -105,6 +105,7 @@ CREATE TABLE "Users" (
     "FirstName" VARCHAR(50) NOT NULL,
     "LastName" VARCHAR(50) NOT NULL,
     "IsActive" BOOLEAN NOT NULL DEFAULT TRUE,
+    "IsDeleted" BOOLEAN NOT NULL DEFAULT FALSE,
     "CreatedAt" TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 ```
@@ -214,21 +215,19 @@ CREATE TABLE "DigitalProducts" (
 ```sql
 CREATE TABLE "InventoryItems" (
     "Id" UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    "ChainId" UUID NOT NULL REFERENCES "Chains"("Id") ON DELETE CASCADE,
     "StoreId" UUID NOT NULL REFERENCES "Stores"("Id") ON DELETE CASCADE,
     "ProductId" UUID NOT NULL REFERENCES "Products"("Id") ON DELETE CASCADE,
     "Quantity" INT NOT NULL DEFAULT 0, -- Physical count in store
     UNIQUE("StoreId", "ProductId")
 );
 
--- Note: EF Core maps PostgreSQL's system column 'xmin' (concurrency token) to a byte[] property
--- mapped via builder.Entity<InventoryItem>().Property(i => i.Version).IsRowVersion();
+-- Note: EF Core maps PostgreSQL's system column 'xmin' (concurrency token) to a uint property
+-- mapped via builder.Entity<InventoryItem>().Property(i => i.Version).HasColumnName("xmin").HasColumnType("xid").IsRowVersion();
 ```
 
 ```sql
 CREATE TABLE "Reservations" (
     "Id" UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    "ChainId" UUID NOT NULL REFERENCES "Chains"("Id") ON DELETE CASCADE,
     "StoreId" UUID NOT NULL REFERENCES "Stores"("Id") ON DELETE CASCADE,
     "ProductId" UUID NOT NULL REFERENCES "Products"("Id") ON DELETE CASCADE,
     "Quantity" INT NOT NULL,
@@ -243,13 +242,12 @@ CREATE TABLE "Reservations" (
 ```sql
 CREATE TABLE "StockMovements" (
     "Id" UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    "ChainId" UUID NOT NULL REFERENCES "Chains"("Id") ON DELETE CASCADE,
     "StoreId" UUID NOT NULL REFERENCES "Stores"("Id") ON DELETE CASCADE,
     "ProductId" UUID NOT NULL REFERENCES "Products"("Id") ON DELETE CASCADE,
     "Type" VARCHAR(20) NOT NULL, -- 'IN', 'OUT', 'ADJUSTMENT'
     "Quantity" INT NOT NULL,
     "Reason" VARCHAR(250) NOT NULL, -- e.g., 'Purchase Order Receipt', 'Sale', 'Damaged Stock'
-    "CreatedByUserId" UUID REFERENCES "Users"("Id") ON DELETE SET NULL,
+    "CreatedByUserId" UUID REFERENCES "Users"("Id") ON DELETE RESTRICT,
     "CreatedAt" TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -683,10 +681,10 @@ To prevent race conditions where two threads try to claim the same stock, we imp
   "storeId": "e22eb5f7-669b-4395-8d59-2ff611603513",
   "productId": "b1b85f64-5717-4562-b3fc-2c963f66afa8",
   "quantity": 5,
-  "expirationMinutes": 15
+  "lifetimeMinutes": 15
 }
 ```
-> ⚠️ **Security Note:** `expirationMinutes` is accepted from the client for operational flexibility (e.g., short vs. long-hold reservations). The server **must clamp this value** against a configured maximum (e.g., `appsettings.json: "MaxReservationExpiryMinutes": 60`) before persisting. Clients cannot set arbitrarily large expirations to hoard stock indefinitely.
+> ⚠️ **Security Note:** `lifetimeMinutes` is accepted from the client for operational flexibility (e.g., short vs. long-hold reservations). The server **must clamp this value** against a configured maximum (e.g., `appsettings.json: "Inventory:MaxReservationLifetimeMinutes": 60`) before persisting. Clients cannot set arbitrarily large expirations to hoard stock indefinitely.
 
 * **Response Schema:** `201 Created`
 ```json
@@ -698,14 +696,15 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ```
 
 #### `POST /api/v1/inventory/adjust`
-* **Description:** Manually adjust physical stock values (triggers audit logging via StockMovements).
+* **Description:** Manually adjust physical stock values (triggers audit logging via StockMovements). Returns 404 if the item doesn't exist yet.
 * **Auth:** Permissions: `inventory:adjust`
 * **Request Schema:**
 ```json
 {
   "storeId": "e22eb5f7-669b-4395-8d59-2ff611603513",
   "productId": "b1b85f64-5717-4562-b3fc-2c963f66afa8",
-  "adjustmentQuantity": -2,
+  "delta": -2,
+  "movementType": "Adjustment",
   "reason": "Damaged container during delivery"
 }
 ```
