@@ -150,24 +150,46 @@ The objective of this phase is to build the core inventory engine, protect again
 
 The objective of this phase is to construct the user interface and integrate it with the backend API using a modern, type-safe frontend stack.
 
+> ⚠️ **Pre-requisite backend changes** — Before starting Phase 5 frontend work, apply these four backend modifications:
+> 1. **CORS:** Add a named CORS policy with `AllowCredentials()` to `Program.cs` allowing `http://localhost:5173`.
+> 2. **HttpOnly Cookie:** Change `AuthController` login/register/refresh/logout endpoints to deliver the refresh token via `HttpOnly`/`Secure`/`SameSite=Strict` cookie instead of the JSON body.
+> 3. **Extended `AuthResponse`:** Add `UserId`, `ChainId`, and `StoreId` fields to the `AuthResponse` record.
+> 4. **Inventory `storeId` filter:** Add an optional `[FromQuery] Guid? storeId` parameter to `GET /api/v1/inventory`; the service applies it only when the caller is a `ChainAdmin`.
+
 #### **Step 5.1: Scaffold & Layout Setup**
 1. Initialize the frontend using Vite + React + TypeScript inside the `frontend/` directory: `npx -y create-vite@latest frontend --template react-ts`.
-2. Install frontend dependencies: `npm install @tanstack/react-query zustand axios react-router-dom`.
+2. Install frontend dependencies: `npm install @tanstack/react-query zustand axios react-router-dom react-hook-form zod @hookform/resolvers`.
 3. Set up the `QueryClient` and `QueryClientProvider` at the application root (`main.tsx`).
 4. Configure vanilla CSS variables for colors, typography, and spacing (supporting light/dark themes).
-5. Define TypeScript interfaces matching the backend API DTOs (e.g., `UserDto`, `ChainDto`, `StoreDto`, `ProductDto`, `InventoryItemDto`) in `src/types/index.ts`.
-6. Create the Axios `apiClient` configured with automatic bearer token injection and a response interceptor for token refresh.
-7. Set up React Router v6 and create the layout with a Sidebar (navigation) and Topbar (user info & store selection).
+5. Define TypeScript interfaces matching the backend API DTOs (`AuthResponse`, `StoreResponse`, `ProductResponse`, `InventoryLevelResponse`, `AdjustStockRequest`, etc.) in `src/types/index.ts`. `AuthResponse` must include `userId`, `chainId`, and `storeId`.
+6. Create the Axios `apiClient` (`src/services/apiClient.ts`) with:
+   - A **request interceptor** that injects the JWT `Authorization: Bearer <token>` header from the Zustand auth store.
+   - A **response interceptor** implementing the singleton in-flight refresh pattern: on a 401, if no refresh is already in-flight, call `POST /api/v1/auth/refresh` (the browser sends the HttpOnly cookie automatically), update the Zustand token, and retry all queued requests. If the refresh fails, call `clearAuth()` and redirect to `/login`.
+7. Set up React Router v6 and define the app route tree:
+   - Public routes: `/login`, `/register`.
+   - Protected layout shell (`/`) wrapping all authenticated pages with a Sidebar and Topbar.
+   - Inventory route uses a path param: `/inventory/:storeId`.
 
 #### **Step 5.2: Auth Shell & Guards**
-1. Create a Zustand store (`useAuthStore`) to manage user login state, the JWT, and resolved user permissions.
-2. Build the `Login` and `RegisterCompany` pages using React state and TanStack Query mutations (`useMutation`) for API calls.
-3. Build the `RouteGuard` component to wrap protected routes, checking permissions from the Zustand store and redirecting unauthorized users.
+1. Create the Zustand `useAuthStore` to hold the in-memory JWT, email, role, permissions, `userId`, `chainId`, and `storeId`. No persistence — token is re-hydrated on page load via a silent refresh.
+2. Implement a silent-refresh bootstrap: on app mount (`App.tsx`), call `POST /api/v1/auth/refresh`. On success, populate the Zustand store with the new token and user identity. On failure (cookie expired/absent), leave the store empty and show the login page.
+3. Build the `Login` and `RegisterCompany` pages using `react-hook-form` + `zod` for form validation and TanStack Query `useMutation` for API calls.
+4. Build the `RouteGuard` component: checks `isAuthenticated` from `useAuthStore` (redirects to `/login` if false) and optionally checks a required permission string (redirects to `/unauthorized` if missing).
 
 #### **Step 5.3: Pages & Forms**
 1. **Dashboard Page:** Displays key stats (total items, low-stock alerts) fetched via TanStack Query `useQuery`.
-2. **Product Catalog Page:** Table view listing products (fetched via `useQuery`), with a modal form to create a product (allowing Physical/Perishable type selection) handled via `useMutation` with automatic query invalidation.
-3. **Inventory Management Page:** List view showing physical, reserved, and available stock levels (fetched via `useQuery` scoped to the selected store), plus a form/modal to submit stock adjustments handled via `useMutation`.
+2. **Product Catalog Page:** Table view listing products (fetched via `useQuery`), with a modal form to create a product:
+   - Product type selection (Physical / Perishable) drives conditional field visibility via `react-hook-form` `watch`.
+   - A `zod` discriminated union schema validates sub-type-specific required fields on the frontend before submitting.
+   - `useMutation` handles the API call with automatic `queryClient.invalidateQueries(['products'])` on success.
+   - Backend 400 errors (e.g., duplicate SKU) are caught and displayed in a form-level error banner.
+3. **Inventory Management Page** (`/inventory/:storeId`):
+   - Reads `storeId` from `useParams()`.
+   - Fetches inventory via `useQuery({ queryKey: ['inventory', storeId], queryFn: () => fetchInventory(storeId) })`.
+   - For a **ChainAdmin** navigating to `/inventory` with no `storeId`, auto-redirect to `/inventory/<first-store-id>` using the first result from the stores list.
+   - For **store-scoped users** (StoreManager / StoreEmployee), always redirect to `/inventory/<jwt-storeId>`; navigation to any other store's URL is blocked by `RouteGuard`.
+   - The Topbar store picker (visible to ChainAdmin only) calls `navigate('/inventory/' + newStoreId)` on selection.
+   - The stock adjustment modal uses a `MovementType` dropdown with human-readable labels (`Stock Receipt`, `Stock Removal`, `Manual Adjustment`) mapped to the backend enum values (`In`, `Out`, `Adjustment`). A `zod` rule validates that the delta sign matches the selected movement type.
 
 ---
 
@@ -265,3 +287,10 @@ The following decisions have been finalized and are locked in for the developmen
 2. **Physical & Perishable Focus:** Digital products are deferred; polymorphic schema and CRUD operations support base Product, Physical, and Perishable types only.
 3. **Direct Stock Adjustments:** Suppliers registry and Purchase Order workflows are deferred. Initial stock counts and edits are managed through direct adjustments.
 4. **Dotnet-Native Background Service:** A dotnet `BackgroundService` is selected over database-specific `pg_cron` dependencies to keep the application host-agnostic. It runs a scheduled task every 60 seconds to update expired reservation records.
+5. **Token Storage — In-Memory JWT + HttpOnly Cookie:** The access JWT is stored in Zustand (in-memory only, cleared on refresh). The refresh token is delivered and stored as an `HttpOnly`/`Secure`/`SameSite=Strict` cookie — never accessible from JavaScript. On page load, a silent `POST /api/v1/auth/refresh` re-hydrates the Zustand store using the cookie automatically sent by the browser.
+6. **Axios Singleton Refresh Pattern:** The Axios response interceptor in `apiClient.ts` uses a module-level in-flight promise to ensure that multiple concurrent 401 responses trigger exactly one `POST /api/v1/auth/refresh` call. All other expired requests queue and retry with the new token once the refresh resolves.
+7. **Inventory URL-Scoped Routing:** The Inventory Management page route is `/inventory/:storeId`. The `storeId` path param drives both the TanStack Query cache key (`['inventory', storeId]`) and the optional `?storeId=` filter sent to `GET /api/v1/inventory`. ChainAdmins default to the first store in their list; store-scoped users are locked to their own store.
+8. **Form Validation — `react-hook-form` + `zod`:** All forms (login, register, create product, adjust stock) use `react-hook-form` with `zod` resolver. Polymorphic product creation uses a `zod` discriminated union on `productType` to conditionally validate sub-type fields client-side. Backend validation remains the authoritative gate; backend 400 errors surface as form-level banners.
+9. **Extended `AuthResponse`:** The `AuthResponse` DTO is extended to include `UserId`, `ChainId`, and `StoreId` so the frontend does not need to decode the JWT. `StoreId` is `null` for `ChainAdmin` users.
+10. **CORS with Credentials:** A named CORS policy (`FrontendDev`) is registered in `Program.cs` allowing `http://localhost:5173` with `AllowCredentials()`. This is required for the HttpOnly cookie to be transmitted on cross-origin requests during local development.
+11. **`MovementType` Explicit Dropdown:** The stock adjustment form exposes a required `MovementType` dropdown with human-readable labels (`Stock Receipt`, `Stock Removal`, `Manual Adjustment`) to preserve semantic fidelity in the `StockMovements` audit ledger. A `zod` rule enforces that the delta sign is consistent with the selected type.
