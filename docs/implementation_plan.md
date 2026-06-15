@@ -7,18 +7,21 @@ This document outlines the complete architectural design and implementation plan
 ## 🗺️ 1. System Architecture Overview
 
 ### Store-Chain Tenancy Model
-* **Chain (Tenant):** The top-level tenant. This represents the company or corporate brand (e.g., "Apex Retail"). Products, suppliers, and roles are defined globally at the Chain level.
-* **Store (Sub-tenant/Branch):** A physical or logical location belonging to a Chain (e.g., "Apex Downtown Store", "Apex Warehouse"). Inventory stock, reservations, and stock movements are tracked individually per Store.
-* **Users & Scoping:**
-  * Users belong to a **Chain** and can optionally be assigned to a specific **Store**.
-  * A **Chain Admin** has a `null` `StoreId` and can access all stores and global settings.
-  * A **Store Employee/Manager** has a non-null `StoreId` and can only view/interact with inventory associated with their specific store.
+
+- **Chain (Tenant):** The top-level tenant. This represents the company or corporate brand (e.g., "Apex Retail"). Products, suppliers, and roles are defined globally at the Chain level.
+- **Store (Sub-tenant/Branch):** A physical or logical location belonging to a Chain (e.g., "Apex Downtown Store", "Apex Warehouse"). Inventory stock, reservations, and stock movements are tracked individually per Store.
+- **Users & Scoping:**
+  - Users belong to a **Chain** and can optionally be assigned to a specific **Store**.
+  - A **Chain Admin** has a `null` `StoreId` and can access all stores and global settings.
+  - A **Store Employee/Manager** has a non-null `StoreId` and can only view/interact with inventory associated with their specific store.
 
 > ⚠️ **ChainId Enforcement Rule:** Every entity that stores tenant data **must** implement `ITenantEntity` and carry a `ChainId` column. EF Core Global Query Filters are applied automatically to all `ITenantEntity` types. Any new entity added to the domain that omits `ChainId` will bypass the tenancy filter entirely and **must be treated as a critical bug**. This is enforced at the `AppDbContext` level and verified by integration tests.
 > **Intentional exceptions:** `InventoryItem`, `Reservation`, and `StockMovement` deliberately do **not** implement `ITenantEntity`. Tenant isolation for these entities is enforced via an explicit join predicate (`Store.ChainId == tenantContext.ChainId`) on every query. This is a documented architectural decision, not a bug.
 
 ### Clean Architecture Layers
+
 The backend is structured into four distinct layers in line with Clean Architecture:
+
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                       API Layer                         │
@@ -52,13 +55,13 @@ erDiagram
     Chain ||--o{ User : "employs"
     Chain ||--o{ Product : "catalogues"
     Chain ||--o{ Supplier : "contracts"
-    
+
     Store ||--o{ User : "assigns"
     Store ||--o{ InventoryItem : "tracks stock"
     Store ||--o{ StockMovement : "records"
     Store ||--o{ Reservation : "holds"
     Store ||--o{ PurchaseOrder : "receives"
-    
+
     User ||--o{ UserPermissions : "has"
 
     Product ||--|| PhysicalProduct : "specializes"
@@ -77,6 +80,7 @@ erDiagram
 ### Table Schema Definitions
 
 #### 🏢 Tenancy & Users
+
 ```sql
 CREATE TABLE "Chains" (
     "Id" UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -109,6 +113,7 @@ CREATE TABLE "Users" (
 ```
 
 #### 🔐 User Permissions & Roles
+
 ```sql
 -- Role functions as an identity and determines the default permissions granted at user creation.
 -- The user's actual permissions are stored directly in UserPermissions, allowing them to be added or removed individually.
@@ -125,6 +130,7 @@ CREATE TABLE "UserPermissions" (
 > 📋 **Permission Resolution Logic:** A user's effective permission set is loaded from the `UserPermissions` table at login time. The `AuthService` encodes this list directly into the JWT claims. The backend strictly checks the JWT for the required permission for each endpoint, and does not perform additional database lookups for authorization. The user's `Role` is also embedded in the JWT to serve as an identity for UI state and default permission templating, but backend authorization relies on the explicit permission list.
 
 #### 🔑 Refresh Tokens (Data Protection API)
+
 ```sql
 CREATE TABLE "RefreshTokens" (
     "Id" UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -145,6 +151,7 @@ CREATE INDEX idx_refresh_tokens_hash ON "RefreshTokens"("TokenHash");
 > 🚫 **Permission Revocation Blacklist:** Permissions are baked into the JWT at login time, so permission changes do not propagate until the token naturally expires (max 15 min). For **immediate session invalidation**, the API maintains an **`IUserRevocationCache`** — an `IMemoryCache`-backed in-process store. When a user's permissions or role are modified, their `UserId` is written to the cache with a 15-minute TTL. The `TenantMiddleware` checks this cache on every authenticated request: if the user's `UserId` is flagged as revoked, the request is immediately rejected with `401 Unauthorized`, forcing re-authentication and a fresh JWT.
 
 #### 📦 Products (TPT Polymorphism)
+
 ```sql
 -- Base Product Table
 CREATE TABLE "Products" (
@@ -186,6 +193,7 @@ CREATE TABLE "DigitalProducts" (
 ```
 
 #### 📊 Inventory & Reservations
+
 ```sql
 CREATE TABLE "InventoryItems" (
     "Id" UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -213,6 +221,7 @@ CREATE TABLE "Reservations" (
 ```
 
 #### 🔄 Stock History & Purchase Orders
+
 ```sql
 CREATE TABLE "StockMovements" (
     "Id" UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -259,7 +268,9 @@ CREATE TABLE "PurchaseOrderItems" (
 ## 🔒 3. Tenancy Middleware & Concurrency Handling
 
 ### Tenancy Middleware Pipeline
-Each authenticated request carries `ChainId` (and optionally `StoreId`) encoded in the JWT claims. 
+
+Each authenticated request carries `ChainId` (and optionally `StoreId`) encoded in the JWT claims.
+
 1. **Extraction:** A custom ASP.NET Core Middleware extracts `ChainId` and `StoreId` from `HttpContext.User`.
 2. **Context Injection:** Inject a scoped `ITenantContext` populated with the current request details:
    ```csharp
@@ -270,6 +281,7 @@ Each authenticated request carries `ChainId` (and optionally `StoreId`) encoded 
    }
    ```
 3. **EF Core Query Filtering:** In the `AppDbContext`, apply global query filters to automatically restrict queries to the tenant's data scope:
+
    ```csharp
    protected override void OnModelCreating(ModelBuilder modelBuilder)
    {
@@ -289,6 +301,7 @@ Each authenticated request carries `ChainId` (and optionally `StoreId`) encoded 
        }
    }
    ```
+
    > ⚠️ **Scoping note:** `InventoryItem`, `Reservation`, and `StockMovement` do **not** implement `ITenantEntity` and carry no `ChainId` column. Tenant isolation for these entities is enforced manually via a join predicate: `i.Store.ChainId == tenantContext.ChainId`. Every query against these entities **must** include this join — there is no automatic EF filter as a safety net.
 
 ### User Revocation Blacklist (In-Memory Cache)
@@ -319,6 +332,7 @@ public sealed class InMemoryUserRevocationCache : IUserRevocationCache
 ```
 
 **Integration in `TenantMiddleware`** (after claims extraction):
+
 ```csharp
 var userIdClaim = context.User.FindFirst("userId")?.Value;
 if (Guid.TryParse(userIdClaim, out var userId))
@@ -362,16 +376,15 @@ Concurrency must be handled according to the following tier system:
 
 To prevent race conditions where two threads try to claim the same stock, we implement a reservation model that calculates **Available Quantity** dynamically and handles EF Core concurrency exceptions.
 
-* **Formula:**
+- **Formula:**
   $$\text{Available Stock} = \text{InventoryItem.Quantity} - \sum \text{Pending/Unexpired Reservations.Quantity}$$
-  
-* **Reservation Flow:**
+- **Reservation Flow:**
   1. Begin Transaction with standard isolation level.
   2. Query `InventoryItem` for (Store, Product) and apply Row Locking using a raw SQL query with `FOR UPDATE`. This prevents concurrent transactions from modifying the stock or securing their own locks on the same row until this transaction completes.
   3. Query active reservations:
      ```csharp
      var reservedQty = await _dbContext.Reservations
-         .Where(r => r.StoreId == storeId && r.ProductId == productId 
+         .Where(r => r.StoreId == storeId && r.ProductId == productId
                      && r.Status == ReservationStatus.Pending && r.ExpiresAt > DateTimeOffset.UtcNow)
          .SumAsync(r => r.Quantity);
      ```
@@ -379,8 +392,9 @@ To prevent race conditions where two threads try to claim the same stock, we imp
   5. Save Changes and Commit Transaction. The lock is released automatically.
   6. If `InventoryItem.Quantity - reservedQty < requestedQty`, roll back the transaction and return a `409 Conflict` or `422 Unprocessable Entity` immediately. No retry loop is required since the read was strictly consistent via the row lock.
 
-* **Reservation Expiry Strategy — PostgreSQL `pg_cron`:**
+- **Reservation Expiry Strategy — PostgreSQL `pg_cron`:**
   Expired reservations (`Status = 'Pending'` and `ExpiresAt < NOW()`) are cleaned up **directly inside the database** using the `pg_cron` extension. This removes any dependency on the API process being alive and eliminates the risk of multiple pods racing to perform cleanup.
+
   ```sql
   -- Enable pg_cron (run once as superuser)
   CREATE EXTENSION IF NOT EXISTS pg_cron;
@@ -397,6 +411,7 @@ To prevent race conditions where two threads try to claim the same stock, we imp
       $$
   );
   ```
+
   > This SQL is applied as part of a dedicated EF Core migration (data migration, not schema). The availability query already filters `ExpiresAt > UtcNow` so the system remains functionally correct even between cron runs.
 
 > ℹ️ **Deployment Note:** `pg_cron` must be explicitly enabled on the PostgreSQL host. It is supported natively on **Supabase** and optionally on **AWS RDS** (via parameter group `shared_preload_libraries`). It is **not available on Azure Database for PostgreSQL Flexible Server**. If deploying to an incompatible host, the fallback strategy is a server-controlled `IHostedService` that executes the same `UPDATE` query on a 1-minute interval, using `SELECT pg_try_advisory_lock(...)` to prevent multiple pods from racing on the cleanup job.
@@ -410,9 +425,11 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 > 🔖 **API Versioning:** All endpoints are versioned under `/api/v1/`. Versioning is implemented using the `Asp.Versioning.Mvc` NuGet package with URL segment strategy. When breaking changes are required in the future, a `/api/v2/` prefix is introduced while the old version is deprecated with a sunset header.
 
 #### `POST /api/v1/auth/register-company`
-* **Description:** Register a new Chain, create its default Admin role, assign full permissions, and register the initial administrator account.
-* **Auth:** Public
-* **Request Schema (`RegisterCompanyRequest`):**
+
+- **Description:** Register a new Chain, create its default Admin role, assign full permissions, and register the initial administrator account.
+- **Auth:** Public
+- **Request Schema (`RegisterCompanyRequest`):**
+
 ```json
 {
   "companyName": "Alpha Inc",
@@ -422,15 +439,25 @@ To prevent race conditions where two threads try to claim the same stock, we imp
   "adminLastName": "Doe"
 }
 ```
-* **Response Schema (`AuthResponse`):** `201 Created`
-  * The refresh token is **not** in the response body. It is set as an `HttpOnly`/`Secure`/`SameSite=Strict` cookie (`Set-Cookie: refreshToken=...`) with a 7-day expiry.
+
+- **Response Schema (`AuthResponse`):** `201 Created`
+  - The refresh token is **not** in the response body. It is set as an `HttpOnly`/`Secure`/`SameSite=Strict` cookie (`Set-Cookie: refreshToken=...`) with a 7-day expiry.
+
 ```json
 {
   "accessToken": "eyJhbGciOi...",
   "accessTokenExpiresIn": 900,
   "email": "admin@alphainc.com",
   "role": "ChainAdmin",
-  "permissions": ["stores:read", "stores:write", "products:read", "products:write", "inventory:read", "inventory:write", "inventory:adjust"],
+  "permissions": [
+    "stores:read",
+    "stores:write",
+    "products:read",
+    "products:write",
+    "inventory:read",
+    "inventory:write",
+    "inventory:adjust"
+  ],
   "userId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
   "chainId": "8fa85f64-5717-4562-b3fc-2c963f66afa7",
   "storeId": null
@@ -438,22 +465,27 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ```
 
 #### `POST /api/v1/auth/login`
-* **Description:** Authenticate user and issue a short-lived JWT (15 min). The refresh token (7 days) is generated by the ASP.NET Core Data Protection API and returned as an `HttpOnly` cookie — never in the response body.
-* **Auth:** Public
-* **Request Schema:**
+
+- **Description:** Authenticate user and issue a short-lived JWT (15 min). The refresh token (7 days) is generated by the ASP.NET Core Data Protection API and returned as an `HttpOnly` cookie — never in the response body.
+- **Auth:** Public
+- **Request Schema:**
+
 ```json
 {
   "email": "user@alphainc.com",
   "password": "Password123!"
 }
 ```
-* **Response Schema:** `200 OK` (Matches `AuthResponse` schema above — no `refreshToken` field in body.)
+
+- **Response Schema:** `200 OK` (Matches `AuthResponse` schema above — no `refreshToken` field in body.)
 
 #### `POST /api/v1/auth/refresh`
-* **Description:** Exchange a valid, non-revoked refresh token for a new access JWT and a rotated refresh token. The refresh token is read from the `refreshToken` HttpOnly cookie (sent automatically by the browser). Old refresh token is immediately invalidated after use; the rotated token is set as a new `HttpOnly` cookie.
-* **Auth:** Public (refresh token in `HttpOnly` cookie — no request body required)
-* **Request Schema:** *(no body)*
-* **Response Schema:** `200 OK`
+
+- **Description:** Exchange a valid, non-revoked refresh token for a new access JWT and a rotated refresh token. The refresh token is read from the `refreshToken` HttpOnly cookie (sent automatically by the browser). Old refresh token is immediately invalidated after use; the rotated token is set as a new `HttpOnly` cookie.
+- **Auth:** Public (refresh token in `HttpOnly` cookie — no request body required)
+- **Request Schema:** _(no body)_
+- **Response Schema:** `200 OK`
+
 ```json
 {
   "accessToken": "eyJhbGciOi...",
@@ -466,37 +498,44 @@ To prevent race conditions where two threads try to claim the same stock, we imp
   "storeId": "..."
 }
 ```
-* **Error Cases:**
-  * `401 Unauthorized` — cookie is absent, invalid, malformed, or expired
-  * `401 Unauthorized` — token has been revoked (session invalidated by admin)
+
+- **Error Cases:**
+  - `401 Unauthorized` — cookie is absent, invalid, malformed, or expired
+  - `401 Unauthorized` — token has been revoked (session invalidated by admin)
 
 #### `POST /api/v1/auth/logout`
-* **Description:** Revoke the current refresh token cookie, effectively ending the session. The server reads the `refreshToken` HttpOnly cookie, marks the token as revoked, and deletes the cookie. Future refresh attempts will return 401.
-* **Auth:** Bearer Token (optional — session is identified by the `refreshToken` cookie, not the access token body)
-* **Request Schema:** *(no body — refresh token is read from the `refreshToken` HttpOnly cookie)*
-* **Response Schema:** `204 No Content`
-  * On success, the server calls `Response.Cookies.Delete("refreshToken")` to clear the cookie.
+
+- **Description:** Revoke the current refresh token cookie, effectively ending the session. The server reads the `refreshToken` HttpOnly cookie, marks the token as revoked, and deletes the cookie. Future refresh attempts will return 401.
+- **Auth:** Bearer Token (optional — session is identified by the `refreshToken` cookie, not the access token body)
+- **Request Schema:** _(no body — refresh token is read from the `refreshToken` HttpOnly cookie)_
+- **Response Schema:** `204 No Content`
+  - On success, the server calls `Response.Cookies.Delete("refreshToken")` to clear the cookie.
 
 #### `GET /api/v1/auth/me`
-* **Description:** Retrieve current authenticated user session detail including effective permissions (union of role-based + direct grants).
-* **Auth:** Bearer Token
-* **Response Schema:** `200 OK` (Current user details including roles and permissions).
+
+- **Description:** Retrieve current authenticated user session detail including effective permissions (union of role-based + direct grants).
+- **Auth:** Bearer Token
+- **Response Schema:** `200 OK` (Current user details including roles and permissions).
 
 ---
 
 ### Stores Management
 
 #### `POST /api/v1/stores`
-* **Description:** Create a new store branch under the chain.
-* **Auth:** Permissions: `stores:write`
-* **Request Schema (`CreateStoreRequest`):**
+
+- **Description:** Create a new store branch under the chain.
+- **Auth:** Permissions: `stores:write`
+- **Request Schema (`CreateStoreRequest`):**
+
 ```json
 {
   "name": "Eastside Warehouse",
   "location": "123 East Blvd, NY"
 }
 ```
-* **Response Schema:** `201 Created`
+
+- **Response Schema:** `201 Created`
+
 ```json
 {
   "id": "e22eb5f7-669b-4395-8d59-2ff611603513",
@@ -507,16 +546,18 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ```
 
 #### `GET /api/v1/stores`
-* **Description:** Get all store locations for the chain.
-* **Auth:** Permissions: `stores:read`
-* **Query Parameters:**
-  * `page` (int, default: 1)
-  * `pageSize` (int, default: 25, max: 100)
-  * `search` (string, optional) — filters by store name
-* **Response Schema:** `200 OK`
+
+- **Description:** Get all store locations for the chain.
+- **Auth:** Permissions: `stores:read`
+- **Query Parameters:**
+  - `page` (int, default: 1)
+  - `pageSize` (int, default: 25, max: 100)
+  - `search` (string, optional) — filters by store name
+- **Response Schema:** `200 OK`
+
 ```json
 {
-  "items": [ ],
+  "items": [],
   "totalCount": 12,
   "page": 1,
   "pageSize": 25
@@ -526,16 +567,22 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 > 📌 **Future Implementation:** `PATCH /api/v1/stores/{id}` (update name/location), `DELETE /api/v1/stores/{id}` (soft-delete with cascade deactivation of store-scoped users).
 
 #### `GET /api/v1/stores/accessible`
-* **Description:** Returns a lightweight list of stores the **current user** can access. For `ChainAdmin` users, this is all stores in the chain (paginated). For `StoreManager` / `StoreEmployee`, this returns only their single assigned store. Used by the Dashboard to resolve the `storeId` for the `GET /api/v1/inventory/summary` call without relying on URL params or persisted Zustand state.
-* **Auth:** Permissions: `stores:read`
-* **Query Parameters:**
-  * `page` (int, default: 1)
-  * `pageSize` (int, default: 25, max: 100)
-* **Response Schema:** `200 OK` — Same paginated wrapper as `GET /api/v1/stores`
+
+- **Description:** Returns a lightweight list of stores the **current user** can access. For `ChainAdmin` users, this is all stores in the chain (paginated). For `StoreManager` / `StoreEmployee`, this returns only their single assigned store. Used by the Dashboard to resolve the `storeId` for the `GET /api/v1/inventory/summary` call without relying on URL params or persisted Zustand state.
+- **Auth:** Permissions: `stores:read`
+- **Query Parameters:**
+  - `page` (int, default: 1)
+  - `pageSize` (int, default: 25, max: 100)
+- **Response Schema:** `200 OK` — Same paginated wrapper as `GET /api/v1/stores`
+
 ```json
 {
   "items": [
-    { "id": "e22eb5f7-669b-4395-8d59-2ff611603513", "name": "Eastside Warehouse", "location": "123 East Blvd, NY" }
+    {
+      "id": "e22eb5f7-669b-4395-8d59-2ff611603513",
+      "name": "Eastside Warehouse",
+      "location": "123 East Blvd, NY"
+    }
   ],
   "totalCount": 1,
   "page": 1,
@@ -548,18 +595,21 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ### User & Dynamic RBAC Management (Admin Only)
 
 #### `GET /api/v1/users`
-* **Description:** Retrieve a list of users within the chain.
-* **Auth:** Permissions: `users:read`
-* **Query Parameters:**
-  * `page` (int, default: 1), `pageSize` (int, default: 25, max: 100)
-  * `search` (string, optional) — filters by name or email
-  * `storeId` (UUID, optional) — filter by assigned store
-* **Response Schema:** `200 OK` Paginated array of user objects (excluding password hashes).
+
+- **Description:** Retrieve a list of users within the chain.
+- **Auth:** Permissions: `users:read`
+- **Query Parameters:**
+  - `page` (int, default: 1), `pageSize` (int, default: 25, max: 100)
+  - `search` (string, optional) — filters by name or email
+  - `storeId` (UUID, optional) — filter by assigned store
+- **Response Schema:** `200 OK` Paginated array of user objects (excluding password hashes).
 
 #### `POST /api/v1/users`
-* **Description:** Create a user account and bind them to a role (which populates their default permissions) and optionally a store.
-* **Auth:** Permissions: `users:write`
-* **Request Schema:**
+
+- **Description:** Create a user account and bind them to a role (which populates their default permissions) and optionally a store.
+- **Auth:** Permissions: `users:write`
+- **Request Schema:**
+
 ```json
 {
   "email": "employee@alphainc.com",
@@ -570,25 +620,32 @@ To prevent race conditions where two threads try to claim the same stock, we imp
   "role": "StoreManager"
 }
 ```
-* **Response Schema:** `201 Created` (Created user detail).
+
+- **Response Schema:** `201 Created` (Created user detail).
 
 #### `POST /api/v1/users/{userId}/permissions`
-* **Description:** Grant specific permissions to a user (mutating their role-based defaults).
-* **Auth:** Permissions: `users:manage`
-* **Request Schema:**
+
+- **Description:** Grant specific permissions to a user (mutating their role-based defaults).
+- **Auth:** Permissions: `users:manage`
+- **Request Schema:**
+
 ```json
 { "permissions": ["inventory:adjust", "stores:write"] }
 ```
-* **Response Schema:** `200 OK`
+
+- **Response Schema:** `200 OK`
 
 #### `DELETE /api/v1/users/{userId}/permissions`
-* **Description:** Revoke specific permissions from a user.
-* **Auth:** Permissions: `users:manage`
-* **Request Schema:**
+
+- **Description:** Revoke specific permissions from a user.
+- **Auth:** Permissions: `users:manage`
+- **Request Schema:**
+
 ```json
 { "permissions": ["inventory:adjust"] }
 ```
-* **Response Schema:** `204 No Content`
+
+- **Response Schema:** `204 No Content`
 
 > 📌 **Future Implementation:** `PATCH /api/v1/users/{id}` (update store assignment, active status, role), `DELETE /api/v1/users/{id}` (soft-delete / deactivate). Permission editing via the UI is planned for a future phase (post-MVP).
 
@@ -597,10 +654,12 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ### Products Catalog
 
 #### `POST /api/v1/products`
-* **Description:** Create a product. Supports Physical, Perishable, and Digital configurations mapping directly to TPT entities.
-* **Auth:** Permissions: `products:write`
-* **Request Schema (`CreateProductRequest`):**
+
+- **Description:** Create a product. Supports Physical, Perishable, and Digital configurations mapping directly to TPT entities.
+- **Auth:** Permissions: `products:write`
+- **Request Schema (`CreateProductRequest`):**
   > ℹ️ **Flat DTO (no nested spec objects):** All sub-type fields are top-level on the request. Fields not applicable to the chosen `productType` must be `null`.
+
 ```json
 {
   "name": "Fresh Organic Milk",
@@ -613,8 +672,11 @@ To prevent race conditions where two threads try to claim the same stock, we imp
   "dimensions": null
 }
 ```
-  > ⚠️ `ExpiryDate` is **not** a product-level field. Expiry is a batch property captured on `PurchaseOrderItem.ExpiryDate` at receipt time. `PerishableProduct` stores only `StorageTemperature` (decimal °C).
-* **Response Schema:** `201 Created`
+
+> ⚠️ `ExpiryDate` is **not** a product-level field. Expiry is a batch property captured on `PurchaseOrderItem.ExpiryDate` at receipt time. `PerishableProduct` stores only `StorageTemperature` (decimal °C).
+
+- **Response Schema:** `201 Created`
+
 ```json
 {
   "id": "b1b85f64-5717-4562-b3fc-2c963f66afa8",
@@ -631,14 +693,15 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ```
 
 #### `GET /api/v1/products`
-* **Description:** Retrieve products for the chain.
-* **Auth:** Permissions: `products:read`
-* **Query Parameters:**
-  * `page` (int, default: 1), `pageSize` (int, default: 25, max: 100)
-  * `search` (string) — filter by name or SKU
-  * `type` (string) — filter by product type: `Physical`, `Perishable`, `Digital`
-  * `isActive` (bool, default: true)
-* **Response Schema:** `200 OK` Paginated array of product records with polymorphic spec blocks.
+
+- **Description:** Retrieve products for the chain.
+- **Auth:** Permissions: `products:read`
+- **Query Parameters:**
+  - `page` (int, default: 1), `pageSize` (int, default: 25, max: 100)
+  - `search` (string) — filter by name or SKU
+  - `type` (string) — filter by product type: `Physical`, `Perishable`, `Digital`
+  - `isActive` (bool, default: true)
+- **Response Schema:** `200 OK` Paginated array of product records with polymorphic spec blocks.
 
 > 📌 **Future Implementation:** `PATCH /api/v1/products/{id}` (update name, price, description, `lowStockThreshold`, `isActive`), `DELETE /api/v1/products/{id}` (soft-delete; sets `IsActive = false`).
 
@@ -647,14 +710,16 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ### Inventory & Reservations Engine
 
 #### `GET /api/v1/inventory`
-* **Description:** Retrieve stock levels. If user is store-scoped (StoreManager / StoreEmployee), only returns stock for their JWT-embedded store and ignores `storeId` query param. ChainAdmins receive all stores by default; they may supply `storeId` to filter to a specific store.
-* **Auth:** Permissions: `inventory:read`
-* **Query Parameters:**
-  * `page` (int, default: 1), `pageSize` (int, default: 25, max: 100)
-  * `storeId` (UUID, optional — **ChainAdmin only**; ignored and overridden by JWT claim for store-scoped users)
-  * `search` (string) — filter by product name or SKU
-  * `lowStockOnly` (bool) — returns only items where `availableQuantity < threshold`
-* **Response Schema:** `200 OK`
+
+- **Description:** Retrieve stock levels. If user is store-scoped (StoreManager / StoreEmployee), only returns stock for their JWT-embedded store and ignores `storeId` query param. ChainAdmins receive all stores by default; they may supply `storeId` to filter to a specific store.
+- **Auth:** Permissions: `inventory:read`
+- **Query Parameters:**
+  - `page` (int, default: 1), `pageSize` (int, default: 25, max: 100)
+  - `storeId` (UUID, optional — **ChainAdmin only**; ignored and overridden by JWT claim for store-scoped users)
+  - `search` (string) — filter by product name or SKU
+  - `lowStockOnly` (bool) — returns only items where `availableQuantity < threshold`
+- **Response Schema:** `200 OK`
+
 ```json
 {
   "items": [
@@ -676,11 +741,13 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ```
 
 #### `GET /api/v1/inventory/summary`
-* **Description:** Retrieve high-level stock statistics (total product lines and low-stock alerts count) for the dashboard. ChainAdmins can scope this to a specific store via `?storeId=`; store-scoped users always receive stats for their assigned store.
-* **Auth:** Permissions: `inventory:read`
-* **Query Parameters:**
-  * `storeId` (UUID, optional — **ChainAdmin only**; ignored and overridden by JWT claim for store-scoped users)
-* **Response Schema:** `200 OK`
+
+- **Description:** Retrieve high-level stock statistics (total product lines and low-stock alerts count) for the dashboard. ChainAdmins can scope this to a specific store via `?storeId=`; store-scoped users always receive stats for their assigned store.
+- **Auth:** Permissions: `inventory:read`
+- **Query Parameters:**
+  - `storeId` (UUID, optional — **ChainAdmin only**; ignored and overridden by JWT claim for store-scoped users)
+- **Response Schema:** `200 OK`
+
 ```json
 {
   "totalProductLines": 150,
@@ -689,9 +756,11 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ```
 
 #### `POST /api/v1/inventory/reserve`
-* **Description:** Reserve a specific quantity of stock for a product in a store. Safe against race conditions.
-* **Auth:** Permissions: `inventory:write`
-* **Request Schema:**
+
+- **Description:** Reserve a specific quantity of stock for a product in a store. Safe against race conditions.
+- **Auth:** Permissions: `inventory:write`
+- **Request Schema:**
+
 ```json
 {
   "storeId": "e22eb5f7-669b-4395-8d59-2ff611603513",
@@ -700,11 +769,13 @@ To prevent race conditions where two threads try to claim the same stock, we imp
   "lifetimeMinutes": 15
 }
 ```
+
 > ⚠️ **Security Note:** `lifetimeMinutes` is accepted from the client for operational flexibility (e.g., short vs. long-hold reservations). The server **must clamp this value** against a configured maximum (e.g., `appsettings.json: "Inventory:MaxReservationLifetimeMinutes": 60`) before persisting. Clients cannot set arbitrarily large expirations to hoard stock indefinitely.
 
 > ⚠️ **Store-Scope Security:** The service **must validate** that `request.StoreId == tenantContext.StoreId` when `tenantContext.StoreId != null` (i.e., when the caller is a `StoreEmployee` or `StoreManager`). A store-scoped user supplying a different `storeId` in the body must receive `403 Forbidden`. ChainAdmins (null `StoreId`) may target any store in their chain.
 
-* **Response Schema:** `201 Created`
+- **Response Schema:** `201 Created`
+
 ```json
 {
   "reservationId": "9c8b7f64-5717-4562-b3fc-2c963f66afa0",
@@ -714,9 +785,11 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ```
 
 #### `POST /api/v1/inventory/adjust`
-* **Description:** Manually adjust physical stock values (triggers audit logging via StockMovements). Returns 404 if the item doesn't exist yet.
-* **Auth:** Permissions: `inventory:adjust`
-* **Request Schema:**
+
+- **Description:** Manually adjust physical stock values (triggers audit logging via StockMovements). Returns 404 if the item doesn't exist yet.
+- **Auth:** Permissions: `inventory:adjust`
+- **Request Schema:**
+
 ```json
 {
   "storeId": "e22eb5f7-669b-4395-8d59-2ff611603513",
@@ -726,9 +799,10 @@ To prevent race conditions where two threads try to claim the same stock, we imp
   "reason": "Damaged container during delivery"
 }
 ```
+
 > ⚠️ **Store-Scope Security:** The service **must validate** that `request.StoreId == tenantContext.StoreId` when `tenantContext.StoreId != null` (i.e., when the caller is a `StoreEmployee` or `StoreManager`). A store-scoped user supplying a different `storeId` in the body must receive `403 Forbidden`. ChainAdmins (null `StoreId`) may target any store in their chain.
 
-* **Response Schema:** `200 OK` (Updated inventory levels).
+- **Response Schema:** `200 OK` (Updated inventory levels).
 
 > 📌 **Future Implementation:** `PATCH /api/v1/inventory/reservations/{id}` (cancel a pending reservation), `PATCH /api/v1/inventory/items/{id}` (update `lowStockThreshold` override at store level).
 
@@ -737,33 +811,40 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ### Suppliers & Procurement
 
 #### `GET /api/v1/suppliers`
-* **Description:** List all suppliers for the chain.
-* **Auth:** Permissions: `suppliers:read`
-* **Query Parameters:** `page`, `pageSize`, `search` (name)
-* **Response Schema:** `200 OK` Paginated supplier list.
+
+- **Description:** List all suppliers for the chain.
+- **Auth:** Permissions: `suppliers:read`
+- **Query Parameters:** `page`, `pageSize`, `search` (name)
+- **Response Schema:** `200 OK` Paginated supplier list.
 
 #### `POST /api/v1/suppliers`
-* **Description:** Create a new supplier profile.
-* **Auth:** Permissions: `suppliers:write`
-* **Request Schema:**
+
+- **Description:** Create a new supplier profile.
+- **Auth:** Permissions: `suppliers:write`
+- **Request Schema:**
+
 ```json
 {
   "name": "Global Dairy Farms",
   "contactInfo": "sales@globaldairy.com | +1-800-555-0199"
 }
 ```
-* **Response Schema:** `201 Created`
+
+- **Response Schema:** `201 Created`
 
 #### `GET /api/v1/purchase-orders`
-* **Description:** List purchase orders for the chain/store.
-* **Auth:** Permissions: `orders:read`
-* **Query Parameters:** `page`, `pageSize`, `storeId`, `status` (`Pending`, `Received`, `Cancelled`)
-* **Response Schema:** `200 OK` Paginated PO list.
+
+- **Description:** List purchase orders for the chain/store.
+- **Auth:** Permissions: `orders:read`
+- **Query Parameters:** `page`, `pageSize`, `storeId`, `status` (`Pending`, `Received`, `Cancelled`)
+- **Response Schema:** `200 OK` Paginated PO list.
 
 #### `POST /api/v1/purchase-orders`
-* **Description:** Place a purchase order for restocking a store.
-* **Auth:** Permissions: `orders:write`
-* **Request Schema:**
+
+- **Description:** Place a purchase order for restocking a store.
+- **Auth:** Permissions: `orders:write`
+- **Request Schema:**
+
 ```json
 {
   "storeId": "e22eb5f7-669b-4395-8d59-2ff611603513",
@@ -772,17 +853,19 @@ To prevent race conditions where two threads try to claim the same stock, we imp
     {
       "productId": "b1b85f64-5717-4562-b3fc-2c963f66afa8",
       "quantity": 50,
-      "unitCost": 3.50
+      "unitCost": 3.5
     }
   ]
 }
 ```
-* **Response Schema:** `201 Created` (Purchase order summary with status `Pending`).
+
+- **Response Schema:** `201 Created` (Purchase order summary with status `Pending`).
 
 #### `POST /api/v1/purchase-orders/{id}/receive`
-* **Description:** Mark PO as completed. Increases store's physical inventory and logs an `IN` stock movement.
-* **Auth:** Permissions: `orders:write`
-* **Response Schema:** `200 OK`
+
+- **Description:** Mark PO as completed. Increases store's physical inventory and logs an `IN` stock movement.
+- **Auth:** Permissions: `orders:write`
+- **Response Schema:** `200 OK`
 
 > 📌 **Future Implementation:** `PATCH /api/v1/purchase-orders/{id}` (update status to `Cancelled`), `PATCH /api/v1/suppliers/{id}` (update contact info), `DELETE /api/v1/suppliers/{id}` (soft-delete).
 
@@ -791,21 +874,24 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 ## 🎨 5. Frontend Architecture (React + Vite)
 
 ### Technical Stack
-* **Build Tool:** Vite (for fast HMR and highly optimized production builds)
-* **Language:** TypeScript (strict type checking enabled to prevent runtime errors and share DTO interfaces)
-* **Router:** React Router v6 (for client-side routing, nested layouts, and route guards)
-* **Server State:** TanStack Query v5 (React Query) (for caching, query invalidation, background synchronization, and request lifecycle management)
-* **Client UI State:** Zustand (for lightweight, zero-boilerplate global UI state management — in-memory only, no persistence)
-* **Form Validation:** `react-hook-form` + `zod` (schema-driven validation with discriminated union support for polymorphic forms)
-* **Styling:** Native CSS (using standard CSS modules for scope isolation and HSL variable-based themes)
+
+- **Build Tool:** Vite (for fast HMR and highly optimized production builds)
+- **Language:** TypeScript (strict type checking enabled to prevent runtime errors and share DTO interfaces)
+- **Router:** React Router v6 (for client-side routing, nested layouts, and route guards)
+- **Server State:** TanStack Query v5 (React Query) (for caching, query invalidation, background synchronization, and request lifecycle management)
+- **Client UI State:** Zustand (for lightweight, zero-boilerplate global UI state management — in-memory only, no persistence)
+- **Form Validation:** `react-hook-form` + `zod` (schema-driven validation with discriminated union support for polymorphic forms)
+- **Styling:** Native CSS (using standard CSS modules for scope isolation and HSL variable-based themes)
 
 ### Auth & Token Architecture
-* **Access Token (JWT):** Stored in Zustand in-memory state only. Injected into every request via Axios request interceptor. Lost on page reload — re-hydrated via silent refresh on app mount.
-* **Refresh Token:** Delivered and stored exclusively as an `HttpOnly`/`Secure`/`SameSite=Strict` cookie. Never accessible from JavaScript. Automatically included by the browser on every `POST /api/v1/auth/refresh` call.
-* **Silent Refresh on Mount:** `App.tsx` tracks an `isHydrating: boolean` state (initially `true`). While `isHydrating` is `true`, a full-screen spinner (centered logo + subtle animation) is rendered. `POST /api/v1/auth/refresh` is called with a **5-second Axios timeout** — if the backend is unreachable, the timeout prevents an infinite spinner. On success, the Zustand store is populated and `isHydrating` is set to `false`. On failure (cookie expired/absent or timeout), `isHydrating` is set to `false` and `RouteGuard` redirects to `/login`.
-* **Singleton Refresh Guard:** The Axios response interceptor uses a module-level `refreshPromise: Promise<string> | null`. Multiple concurrent 401s share one refresh call; all queued requests retry with the new token.
+
+- **Access Token (JWT):** Stored in Zustand in-memory state only. Injected into every request via Axios request interceptor. Lost on page reload — re-hydrated via silent refresh on app mount.
+- **Refresh Token:** Delivered and stored exclusively as an `HttpOnly`/`Secure`/`SameSite=Strict` cookie. Never accessible from JavaScript. Automatically included by the browser on every `POST /api/v1/auth/refresh` call.
+- **Silent Refresh on Mount:** `App.tsx` tracks an `isHydrating: boolean` state (initially `true`). While `isHydrating` is `true`, a full-screen spinner (centered logo + subtle animation) is rendered. `POST /api/v1/auth/refresh` is called with a **5-second Axios timeout** — if the backend is unreachable, the timeout prevents an infinite spinner. On success, the Zustand store is populated and `isHydrating` is set to `false`. On failure (cookie expired/absent or timeout), `isHydrating` is set to `false` and `RouteGuard` redirects to `/login`.
+- **Singleton Refresh Guard:** The Axios response interceptor uses a module-level `refreshPromise: Promise<string> | null`. Multiple concurrent 401s share one refresh call; all queued requests retry with the new token.
 
 ### Folder Structure
+
 We will organize the project in the workspace root with two main folders: `backend/` and `frontend/`. The frontend project is structured as follows:
 
 ```
@@ -870,6 +956,7 @@ frontend/
 ### TypeScript Integration Guidelines
 
 To guarantee full type safety across the client-server boundary, the frontend implements the following TypeScript practices:
+
 1. **Strict Type Safety:** `noImplicitAny` and `strictNullChecks` are enabled in `tsconfig.json`.
 2. **DTO & Domain Models:** All request payloads and response bodies have dedicated TypeScript interfaces matching the backend models (e.g. `ProductDto`, `StockMovementDto`, `RegisterCompanyRequest`).
 3. **Generics in API Requests:** Axios client calls and TanStack Query hooks utilize these interfaces to ensure compile-time verification of properties.
@@ -877,33 +964,39 @@ To guarantee full type safety across the client-server boundary, the frontend im
 ### State Management Strategy
 
 #### 1. Server State (TanStack Query v5)
+
 Used for all asynchronous operations communicating with the backend database. TanStack Query isolates caching logic, background synchronization, and automatic loading/error indicators.
 
-* **Query Keys:** Structured as hierarchical arrays for clean invalidation: `['products']`, `['products', productId]`, `['inventory', storeId]`.
-* **v5 Syntax:** Queries and mutations use object parameters instead of deprecated positional arguments.
+- **Query Keys:** Structured as hierarchical arrays for clean invalidation: `['products']`, `['products', productId]`, `['inventory', storeId]`.
+- **v5 Syntax:** Queries and mutations use object parameters instead of deprecated positional arguments.
 
 ##### **Example: Custom Hook for Product Management**
+
 ```typescript
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { fetchProducts, createProduct } from '../services/api/productService';
-import { ProductDto, CreateProductRequest } from '../types';
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { fetchProducts, createProduct } from "../services/api/productService";
+import { ProductDto, CreateProductRequest } from "../types";
 
 export const useProducts = () => {
   const queryClient = useQueryClient();
 
   // Query catalog using object arguments (v5 standard)
   const productsQuery = useQuery<ProductDto[], Error>({
-    queryKey: ['products'],
+    queryKey: ["products"],
     queryFn: fetchProducts,
     staleTime: 5 * 60 * 1000, // Cache valid for 5 minutes
   });
 
   // Mutation for creating a new product with cache invalidation on success
-  const createProductMutation = useMutation<ProductDto, Error, CreateProductRequest>({
+  const createProductMutation = useMutation<
+    ProductDto,
+    Error,
+    CreateProductRequest
+  >({
     mutationFn: (newProduct) => createProduct(newProduct),
     onSuccess: () => {
       // Invalidate products query cache to trigger automatic background refetch
-      queryClient.invalidateQueries({ queryKey: ['products'] });
+      queryClient.invalidateQueries({ queryKey: ["products"] });
     },
   });
 
@@ -919,12 +1012,14 @@ export const useProducts = () => {
 ```
 
 #### 2. Local State (Zustand)
+
 Two Zustand stores are used:
 
 **`authStore.ts`** — Holds the in-memory JWT and resolved user identity. No persistence. Re-hydrated from the HttpOnly cookie on app mount via silent refresh.
+
 ```typescript
-import { create } from 'zustand';
-import type { AuthResponse } from '../types';
+import { create } from "zustand";
+import type { AuthResponse } from "../types";
 
 interface AuthState {
   token: string | null;
@@ -939,21 +1034,40 @@ interface AuthState {
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
-  token: null, email: null, role: null, permissions: [],
-  userId: null, chainId: null, storeId: null,
-  setAuth: (response, token) => set({
-    token, email: response.email, role: response.role,
-    permissions: response.permissions, userId: response.userId,
-    chainId: response.chainId, storeId: response.storeId ?? null,
-  }),
-  clearAuth: () => set({ token: null, email: null, role: null, permissions: [],
-    userId: null, chainId: null, storeId: null }),
+  token: null,
+  email: null,
+  role: null,
+  permissions: [],
+  userId: null,
+  chainId: null,
+  storeId: null,
+  setAuth: (response, token) =>
+    set({
+      token,
+      email: response.email,
+      role: response.role,
+      permissions: response.permissions,
+      userId: response.userId,
+      chainId: response.chainId,
+      storeId: response.storeId ?? null,
+    }),
+  clearAuth: () =>
+    set({
+      token: null,
+      email: null,
+      role: null,
+      permissions: [],
+      userId: null,
+      chainId: null,
+      storeId: null,
+    }),
 }));
 ```
 
 **`uiStore.ts`** — Transient UI state only (sidebar toggle, etc.). The selected store is **not** stored here — it lives in the URL as `/inventory/:storeId`.
+
 ```typescript
-import { create } from 'zustand';
+import { create } from "zustand";
 
 interface UIState {
   sidebarOpen: boolean;
@@ -967,12 +1081,13 @@ export const useUIStore = create<UIState>((set) => ({
 ```
 
 ### Route-Level RBAC Protection
+
 We wrap components using a `RouteGuard` to check user permissions dynamically before loading pages.
 
 ```tsx
-import React from 'react';
-import { Navigate } from 'react-router-dom';
-import { useAuth } from '../hooks/useAuth';
+import React from "react";
+import { Navigate } from "react-router-dom";
+import { useAuth } from "../hooks/useAuth";
 
 interface RouteGuardProps {
   requiredPermission?: string;
@@ -980,8 +1095,17 @@ interface RouteGuardProps {
   children: React.ReactNode;
 }
 
-export const RouteGuard: React.FC<RouteGuardProps> = ({ requiredPermission, storeScope, children }) => {
-  const { isAuthenticated, isChainAdmin, hasPermission, storeId: jwtStoreId } = useAuth();
+export const RouteGuard: React.FC<RouteGuardProps> = ({
+  requiredPermission,
+  storeScope,
+  children,
+}) => {
+  const {
+    isAuthenticated,
+    isChainAdmin,
+    hasPermission,
+    storeId: jwtStoreId,
+  } = useAuth();
   const { storeId: paramStoreId } = useParams();
 
   if (!isAuthenticated) {
@@ -996,7 +1120,12 @@ export const RouteGuard: React.FC<RouteGuardProps> = ({ requiredPermission, stor
   // Store-scope guard: non-ChainAdmin users may only access their own store's URL.
   // Uses a synchronous early return (not useEffect+navigate) to prevent children from
   // rendering — and firing useQuery — before the redirect resolves.
-  if (storeScope && !isChainAdmin && paramStoreId && paramStoreId !== jwtStoreId) {
+  if (
+    storeScope &&
+    !isChainAdmin &&
+    paramStoreId &&
+    paramStoreId !== jwtStoreId
+  ) {
     return <Navigate to={`/inventory/${jwtStoreId}`} replace />;
   }
 
@@ -1038,7 +1167,8 @@ gantt
 #### 📦 Phase 1: Core Setup & Boilerplate
 
 ##### **Step 1: Create clean architecture solution template**
-* **1.1. Substeps:**
+
+- **1.1. Substeps:**
   1. In the workspace root, create two parent directories: `backend/` and `frontend/`.
   2. Initialize the dotnet solution inside the `backend/` folder: `dotnet new sln -n Inventra` (from the `backend/` context).
   3. Create the 4 class libraries/webapi projects representing Clean Architecture layers inside the `backend/` directory:
@@ -1050,13 +1180,14 @@ gantt
   5. Wire up project dependencies: `API` depends on `Application` and `Infrastructure`; `Infrastructure` depends on `Application`; `Application` depends on `Domain`.
   6. Install global packages: `Microsoft.EntityFrameworkCore`, `Npgsql.EntityFrameworkCore.PostgreSQL`, `BCrypt.Net-Next`, `Microsoft.AspNetCore.Authentication.JwtBearer`.
 
-* **1.2. Unit Testing & Mocking Strategy:**
-  * **Objective:** Ensure dependency injection (DI) bootstrap bindings resolve all core services cleanly.
-  * **Test Setup:** Use the custom API Host builder to perform a dry run resolution test.
-  * **Mock Details:** Mock the connection string to prevent actual database connections during DI resolution checks.
-  * **Functions to Test:**
-    * `Program.cs` / Dependency Injection registrations.
-  * **Sample Mock Setup & Test Case:**
+- **1.2. Unit Testing & Mocking Strategy:**
+  - **Objective:** Ensure dependency injection (DI) bootstrap bindings resolve all core services cleanly.
+  - **Test Setup:** Use the custom API Host builder to perform a dry run resolution test.
+  - **Mock Details:** Mock the connection string to prevent actual database connections during DI resolution checks.
+  - **Functions to Test:**
+    - `Program.cs` / Dependency Injection registrations.
+  - **Sample Mock Setup & Test Case:**
+
     ```csharp
     [Fact]
     public void DependencyInjection_ShouldResolveCoreServices()
@@ -1073,7 +1204,8 @@ gantt
     ```
 
 ##### **Step 2: Initialize Database Context and Tenancy Pipeline**
-* **2.1. Substeps:**
+
+- **2.1. Substeps:**
   1. Define `ITenantEntity` interface in the Domain layer:
      ```csharp
      public interface ITenantEntity
@@ -1086,13 +1218,14 @@ gantt
   4. Map the PostgreSQL `xmin` system column to the `InventoryItem` entity for optimistic concurrency control (used for administrative edits). Do **not** configure xmin on `Reservation` -- it adds model complexity for no benefit, since reservation conflicts are handled via Row locking during the reservation process.
   5. Run the initial EF Core migration using Entity Framework CLI: `dotnet ef migrations add InitialMigration --project Inventra.Infrastructure --startup-project Inventra.API`.
 
-* **2.2. Unit Testing & Mocking Strategy:**
-  * **Objective:** Validate that global query filtering correctly isolates DB operations between tenants.
-  * **Test Setup:** Use SQLite in-memory (`UseSqlite("DataSource=:memory:")`) to populate test data for multiple ChainIds. SQLite enforces real SQL semantics including unique constraints, unlike the EF InMemory provider.
-  * **Mock Details:** Mock the `ITenantContext` to switch between Chain IDs during the execution.
-  * **Functions to Test:**
-    * `AppDbContext.OnModelCreating()` (specifically global query filters).
-  * **Sample Mock Setup & Test Case:**
+- **2.2. Unit Testing & Mocking Strategy:**
+  - **Objective:** Validate that global query filtering correctly isolates DB operations between tenants.
+  - **Test Setup:** Use SQLite in-memory (`UseSqlite("DataSource=:memory:")`) to populate test data for multiple ChainIds. SQLite enforces real SQL semantics including unique constraints, unlike the EF InMemory provider.
+  - **Mock Details:** Mock the `ITenantContext` to switch between Chain IDs during the execution.
+  - **Functions to Test:**
+    - `AppDbContext.OnModelCreating()` (specifically global query filters).
+  - **Sample Mock Setup & Test Case:**
+
     ```csharp
     [Fact]
     public async Task DbContext_GlobalQueryFilter_IsolatesTenantData()
@@ -1125,7 +1258,8 @@ gantt
 #### 🔐 Phase 2: Security, Tenancy Pipeline & RBAC
 
 ##### **Step 3: Build Custom Tenancy Extraction Middleware**
-* **3.1. Substeps:**
+
+- **3.1. Substeps:**
   1. Define a scoped `ITenantContext` interface and its implementation:
      ```csharp
      public interface ITenantContext
@@ -1139,13 +1273,14 @@ gantt
   4. Populate the scoped `ITenantContext` instance so that it's accessible within service layers and `AppDbContext` for the duration of the request.
   5. Add fallback handling to reject requests with `401 Unauthorized` if requests to protected endpoints fail to provide a valid token or tenant scope.
 
-* **3.2. Unit Testing & Mocking Strategy:**
-  * **Objective:** Ensure the middleware accurately reads Claims and binds them to the context container.
-  * **Test Setup:** Mock `HttpContext`, `ClaimsPrincipal`, and `RequestDelegate`.
-  * **Mock Details:** Mock the context claims collection, simulating an authenticated user with distinct claim configurations.
-  * **Functions to Test:**
-    * `TenantMiddleware.InvokeAsync(HttpContext context, ITenantContext tenantContext)`
-  * **Sample Mock Setup & Test Case:**
+- **3.2. Unit Testing & Mocking Strategy:**
+  - **Objective:** Ensure the middleware accurately reads Claims and binds them to the context container.
+  - **Test Setup:** Mock `HttpContext`, `ClaimsPrincipal`, and `RequestDelegate`.
+  - **Mock Details:** Mock the context claims collection, simulating an authenticated user with distinct claim configurations.
+  - **Functions to Test:**
+    - `TenantMiddleware.InvokeAsync(HttpContext context, ITenantContext tenantContext)`
+  - **Sample Mock Setup & Test Case:**
+
     ```csharp
     [Fact]
     public async Task TenantMiddleware_ExtractsClaims_PopulatesTenantContext()
@@ -1153,7 +1288,7 @@ gantt
         // 1. Arrange
         var chainId = Guid.NewGuid();
         var storeId = Guid.NewGuid();
-        
+
         var claims = new List<Claim>
         {
             new Claim("ChainId", chainId.ToString()),
@@ -1178,20 +1313,22 @@ gantt
     ```
 
 ##### **Step 4: Implement Permission-Checking Action Filters**
-* **4.1. Substeps:**
+
+- **4.1. Substeps:**
   1. Define a custom `[HasPermission]` authorization attribute referencing permission strings (e.g. `inventory:read`).
   2. Implement `PermissionFilter` inheriting from `IAsyncAuthorizationFilter`.
   3. Query JWT claims for the `permissions` array.
   4. Grant access if user permissions contains the specified string or the global administrator asterisk (`*`).
   5. Short-circuit execution and return `403 Forbidden` if validation requirements fail.
 
-* **4.2. Unit Testing & Mocking Strategy:**
-  * **Objective:** Ensure route access protection handles permissions, missing user profiles, and super-user wildcards.
-  * **Test Setup:** Mock `AuthorizationFilterContext` and its associated parameters.
-  * **Mock Details:** Mock `HttpContext`, routing parameters, and generic action descriptor payloads.
-  * **Functions to Test:**
-    * `PermissionFilter.OnAuthorizationAsync(AuthorizationFilterContext context)`
-  * **Sample Mock Setup & Test Case:**
+- **4.2. Unit Testing & Mocking Strategy:**
+  - **Objective:** Ensure route access protection handles permissions, missing user profiles, and super-user wildcards.
+  - **Test Setup:** Mock `AuthorizationFilterContext` and its associated parameters.
+  - **Mock Details:** Mock `HttpContext`, routing parameters, and generic action descriptor payloads.
+  - **Functions to Test:**
+    - `PermissionFilter.OnAuthorizationAsync(AuthorizationFilterContext context)`
+  - **Sample Mock Setup & Test Case:**
+
     ```csharp
     [Fact]
     public async Task PermissionFilter_NoMatchingPermission_ReturnsForbidden()
@@ -1225,7 +1362,8 @@ gantt
 #### 🏢 Phase 3: Tenant Registration & User Admin Service
 
 ##### **Step 5: Create Registration, Login & Token Refresh Orchestrator**
-* **5.1. Substeps:**
+
+- **5.1. Substeps:**
   1. Build `AuthService` in the Application layer.
   2. Install required NuGet packages: `Microsoft.AspNetCore.DataProtection`, `Asp.Versioning.Mvc`.
   3. Implement `RegisterCompany(RegisterCompanyRequest request)`:
@@ -1251,15 +1389,16 @@ gantt
   6. Implement `Logout(string rawRefreshToken)`:
      - Hash the token and set `IsRevoked = true` on the matching row.
 
-* **5.2. Unit Testing & Mocking Strategy:**
-  * **Objective:** Verify atomic transaction bounds, proper role seeding, permission union resolution, and refresh token rotation.
-  * **Test Setup:** Use SQLite in-memory (`UseSqlite("DataSource=:memory:")`) for realistic constraint enforcement. Mock `IPasswordHasher`, `IDataProtector`, and `ITokenService`.
-  * **Mock Details:** Mock `IDataProtector` to return predictable protect/unprotect values.
-  * **Functions to Test:**
-    * `AuthService.RegisterCompany(RegisterCompanyRequest request)`
-    * `AuthService.Login(LoginRequest request)`
-    * `AuthService.RefreshToken(RefreshTokenRequest request)`
-  * **Sample Mock Setup & Test Case:**
+- **5.2. Unit Testing & Mocking Strategy:**
+  - **Objective:** Verify atomic transaction bounds, proper role seeding, permission union resolution, and refresh token rotation.
+  - **Test Setup:** Use SQLite in-memory (`UseSqlite("DataSource=:memory:")`) for realistic constraint enforcement. Mock `IPasswordHasher`, `IDataProtector`, and `ITokenService`.
+  - **Mock Details:** Mock `IDataProtector` to return predictable protect/unprotect values.
+  - **Functions to Test:**
+    - `AuthService.RegisterCompany(RegisterCompanyRequest request)`
+    - `AuthService.Login(LoginRequest request)`
+    - `AuthService.RefreshToken(RefreshTokenRequest request)`
+  - **Sample Mock Setup & Test Case:**
+
     ```csharp
     [Fact]
     public async Task RegisterCompany_OnDatabaseException_RollsBackTransaction()
@@ -1267,7 +1406,7 @@ gantt
         // 1. Arrange
         var mockContext = new Mock<AppDbContext>();
         var mockTransaction = new Mock<IDbContextTransaction>();
-        
+
         mockContext.Setup(c => c.Database.BeginTransactionAsync(default))
                    .ReturnsAsync(mockTransaction.Object);
         // Throw when adding a Chain
@@ -1324,7 +1463,8 @@ gantt
 #### 📦 Phase 4: Product Catalog & Suppliers Management
 
 ##### **Step 6: Build TPT-Polymorphic Product CRUD Handlers**
-* **6.1. Substeps:**
+
+- **6.1. Substeps:**
   1. Build `ProductService` managing product CRUD logic.
   2. Implement `CreateProduct(CreateProductRequest request)` handling polymorphic mappings:
      - Check if SKU already exists globally for the current Chain (tenant validation).
@@ -1332,14 +1472,15 @@ gantt
      - Insert entity hierarchy. EF Core TPT will automatically create records in both base and specialized tables.
   3. Implement `GetProducts()` fetching records. Auto-scoping handles the filtering so that users only see items belonging to their Chain.
 
-* **6.2. Unit Testing & Mocking Strategy:**
-  * **Objective:** Ensure polymorphic serialization functions correctly and global queries enforce strict tenant separation.
-  * **Test Setup:** Use SQLite in-memory (`UseSqlite("DataSource=:memory:")`) — enforces unique constraint on `(ChainId, SKU)`, confirming the conflict check works at the DB level too.
-  * **Mock Details:** Populate distinct products across different `ChainId` targets.
-  * **Functions to Test:**
-    * `ProductService.CreateProduct(CreateProductRequest request)`
-    * `ProductService.GetProducts()`
-  * **Sample Mock Setup & Test Case:**
+- **6.2. Unit Testing & Mocking Strategy:**
+  - **Objective:** Ensure polymorphic serialization functions correctly and global queries enforce strict tenant separation.
+  - **Test Setup:** Use SQLite in-memory (`UseSqlite("DataSource=:memory:")`) — enforces unique constraint on `(ChainId, SKU)`, confirming the conflict check works at the DB level too.
+  - **Mock Details:** Populate distinct products across different `ChainId` targets.
+  - **Functions to Test:**
+    - `ProductService.CreateProduct(CreateProductRequest request)`
+    - `ProductService.GetProducts()`
+  - **Sample Mock Setup & Test Case:**
+
     ```csharp
     [Fact]
     public async Task CreateProduct_DuplicateSKUWithinChain_ThrowsConflictException()
@@ -1371,20 +1512,22 @@ gantt
 #### 📊 Phase 5: Stock Reservation & Concurrency Engine
 
 ##### **Step 7: Build Dynamic Available Stock Query & Reservation Check**
-* **7.1. Substeps:**
+
+- **7.1. Substeps:**
   1. Create `ReservationService`.
   2. Implement availability computation logic:
      $$\text{Available Stock} = \text{InventoryItem.Quantity} - \sum \text{Active Reservations}$$
   3. When placing a reservation, read physical stock and verify availability within a database transaction.
   4. Write a new `Reservation` record with status `Pending` and expiration duration configuration.
 
-* **7.2. Unit Testing & Mocking Strategy:**
-  * **Objective:** Verify calculations correctly incorporate active reservations while ignoring expired or completed ones.
-  * **Test Setup:** Mock standard data entities with active, expired, and completed reservations.
-  * **Mock Details:** Set up `DateTimeOffset.UtcNow` mock contexts if needed.
-  * **Functions to Test:**
-    * `ReservationService.GetAvailableStock(Guid storeId, Guid productId)`
-  * **Sample Mock Setup & Test Case:**
+- **7.2. Unit Testing & Mocking Strategy:**
+  - **Objective:** Verify calculations correctly incorporate active reservations while ignoring expired or completed ones.
+  - **Test Setup:** Mock standard data entities with active, expired, and completed reservations.
+  - **Mock Details:** Set up `DateTimeOffset.UtcNow` mock contexts if needed.
+  - **Functions to Test:**
+    - `ReservationService.GetAvailableStock(Guid storeId, Guid productId)`
+  - **Sample Mock Setup & Test Case:**
+
     ```csharp
     [Fact]
     public async Task GetAvailableStock_CalculatesCorrectly_ExcludesExpiredReservations()
@@ -1402,15 +1545,15 @@ gantt
             .Options;
 
         using var context = new AppDbContext(options, mockTenantContext.Object);
-        
+
         // Setup inventory count = 100
         // Note: InventoryItem has NO ChainId — isolation is via Store.ChainId join, not ITenantEntity
         context.InventoryItems.Add(new InventoryItem { StoreId = storeId, ProductId = productId, Quantity = 100 });
-        
+
         // Active reservation: 15
         // Note: Reservation has NO ChainId — isolation is via Store.ChainId join, not ITenantEntity
         context.Reservations.Add(new Reservation { StoreId = storeId, ProductId = productId, Quantity = 15, Status = ReservationStatus.Pending, ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(15) });
-        
+
         // Expired reservation: 20
         context.Reservations.Add(new Reservation { StoreId = storeId, ProductId = productId, Quantity = 20, Status = ReservationStatus.Pending, ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-10) });
 
@@ -1428,26 +1571,28 @@ gantt
     ```
 
 ##### **Step 8: Implement Row Locking for Reservation Engine**
-* **8.1. Substeps:**
+
+- **8.1. Substeps:**
   1. Implement the stock availability check using Row locking to lock the `InventoryItem` row.
   2. Calculate the dynamic reservation quantity while the row lock is held.
   3. If sufficient stock is available, insert the reservation and commit to release the lock.
   4. If stock is insufficient, abort the transaction and throw a `409 ConflictException` (no retry loop is needed).
 
-* **8.2. Unit Testing & Mocking Strategy:**
-  * **Objective:** Test that the system successfully prevents overselling by rejecting the reservation if stock is exhausted, verifying the transaction boundary.
-  * **Test Setup:** Mock a DbContext instance configured to throw concurrency exceptions during `SaveChangesAsync`.
-  * **Mock Details:** Setup dynamic Mock returns utilizing callbacks to mock changes to database records.
-  * **Functions to Test:**
-    * `ReservationService.ReserveStockWithRetry(ReserveStockRequest request)`
-  * **Sample Mock Setup & Test Case:**
+- **8.2. Unit Testing & Mocking Strategy:**
+  - **Objective:** Test that the system successfully prevents overselling by rejecting the reservation if stock is exhausted, verifying the transaction boundary.
+  - **Test Setup:** Mock a DbContext instance configured to throw concurrency exceptions during `SaveChangesAsync`.
+  - **Mock Details:** Setup dynamic Mock returns utilizing callbacks to mock changes to database records.
+  - **Functions to Test:**
+    - `ReservationService.ReserveStockWithRetry(ReserveStockRequest request)`
+  - **Sample Mock Setup & Test Case:**
+
     ```csharp
     [Fact]
     public async Task ReserveStock_ConcurrencyFailure_RetriesAndEventuallyThrows()
     {
         // 1. Arrange
         var mockContext = new Mock<AppDbContext>();
-        
+
         // Simulate DbUpdateConcurrencyException during SaveChangesAsync
         mockContext.Setup(c => c.SaveChangesAsync(default))
                    .ThrowsAsync(new DbUpdateConcurrencyException());
@@ -1461,21 +1606,23 @@ gantt
         // 2. Act & Assert
         // Verify that after 3 retries, custom conflict exception is thrown
         await Assert.ThrowsAsync<ConflictException>(() => service.ReserveStockWithRetry(request));
-        
+
         // Verify SaveChangesAsync was attempted exactly 3 times
         mockContext.Verify(c => c.SaveChangesAsync(default), Times.Exactly(3));
     }
     ```
 
-##### **Step 9: Schedule Reservation Expiry via `pg_cron` Data Migration** *(Post-MVP — Full Deployment Only)*
+##### **Step 9: Schedule Reservation Expiry via `pg_cron` Data Migration** _(Post-MVP — Full Deployment Only)_
 
 > 🚫 **MVP NOTE:** This step is **deferred** in the MVP. The MVP uses a dotnet `BackgroundService` (`ReservationCleanupWorker`) instead — see `mvp_implementation_plan.md` Step 4.3. `pg_cron` requires PostgreSQL superuser access and a compatible host (Supabase / AWS RDS). Implement Step 9 only when moving to a production PostgreSQL host that supports the extension.
-* **9.1. Substeps:**
+
+- **9.1. Substeps:**
   1. Enable the `pg_cron` extension on the PostgreSQL server (run once by a superuser / DBA script):
      ```sql
      CREATE EXTENSION IF NOT EXISTS pg_cron;
      ```
   2. Create a dedicated EF Core **data migration** (not a schema migration) that registers the cron job on first deploy:
+
      ```csharp
      // Migrations/20260601_AddPgCronExpiryJob.cs
      public partial class AddPgCronExpiryJob : Migration
@@ -1502,15 +1649,17 @@ gantt
          }
      }
      ```
+
   3. Verify the job is registered after migration: `SELECT * FROM cron.job;`
   4. **No `BackgroundService` or `IHostedService` is needed.** The database handles expiry independently of API pod health or count.
 
 > ✅ **Correctness guarantee:** The `GetAvailableStock` query already filters `ExpiresAt > UtcNow`, so even in the worst case (cron fires 59 seconds late), no over-reservation can occur. The cron job is a cleanup operation only — it has no bearing on system correctness.
 
-* **9.2. Testing Strategy:**
-  * **Objective:** Verify the SQL `UPDATE` statement correctly targets only pending + expired rows.
-  * **Test Setup:** Use a real PostgreSQL integration test database (via Testcontainers or a dedicated test DB). SQLite in-memory cannot be used here since `pg_cron` is PostgreSQL-specific.
-  * **Sample Integration Test:**
+- **9.2. Testing Strategy:**
+  - **Objective:** Verify the SQL `UPDATE` statement correctly targets only pending + expired rows.
+  - **Test Setup:** Use a real PostgreSQL integration test database (via Testcontainers or a dedicated test DB). SQLite in-memory cannot be used here since `pg_cron` is PostgreSQL-specific.
+  - **Sample Integration Test:**
+
     ```csharp
     [Fact]
     public async Task PgCronJob_WhenExecuted_MarksOnlyExpiredPendingReservationsAsExpired()
@@ -1555,7 +1704,8 @@ gantt
 > 🚫 **MVP NOTE: This phase is deferred.** Purchase Orders, Suppliers, and the fulfillment pipeline are out of MVP scope. Initial stock counts are managed via direct adjustments (`POST /api/v1/inventory/adjust`). Implement Phase 6 only when the full procurement pipeline is required.
 
 ##### **Step 10: Implement Purchase Order Fulfillment Pipeline**
-* **10.1. Substeps:**
+
+- **10.1. Substeps:**
   1. Implement `PurchaseOrderService`.
   2. Implement `ReceivePurchaseOrder(Guid poId)`:
      - Wrap inventory update operations in an EF transaction.
@@ -1567,13 +1717,14 @@ gantt
        - Write a record into `StockMovements` with type `"IN"` and reason `"Purchase Order Receipt"`.
      - Commit the transaction.
 
-* **10.2. Unit Testing & Mocking Strategy:**
-  * **Objective:** Ensure stock receipt updates physical quantity, logs history, and rolls back atomically on exceptions.
-  * **Test Setup:** Use SQLite in-memory (`UseSqlite("DataSource=:memory:")`) to seed a realistic PO and inventory graph, verifying FK relationships and transaction commit behaviour.
-  * **Mock Details:** Mock database validation errors on specific items to test transaction safety.
-  * **Functions to Test:**
-    * `PurchaseOrderService.ReceivePurchaseOrder(Guid poId)`
-  * **Sample Mock Setup & Test Case:**
+- **10.2. Unit Testing & Mocking Strategy:**
+  - **Objective:** Ensure stock receipt updates physical quantity, logs history, and rolls back atomically on exceptions.
+  - **Test Setup:** Use SQLite in-memory (`UseSqlite("DataSource=:memory:")`) to seed a realistic PO and inventory graph, verifying FK relationships and transaction commit behaviour.
+  - **Mock Details:** Mock database validation errors on specific items to test transaction safety.
+  - **Functions to Test:**
+    - `PurchaseOrderService.ReceivePurchaseOrder(Guid poId)`
+  - **Sample Mock Setup & Test Case:**
+
     ```csharp
     [Fact]
     public async Task ReceivePurchaseOrder_POIsFulfilled_StockAndMovementsUpdated()
@@ -1592,7 +1743,7 @@ gantt
             .Options;
 
         using var context = new AppDbContext(options, mockTenantContext.Object);
-        
+
         // Seed PO
         var po = new PurchaseOrder { Id = poId, StoreId = storeId, Status = "Pending", ChainId = tenantId };
         po.Items.Add(new PurchaseOrderItem { ProductId = productId, Quantity = 50, UnitCost = 1.00m });
@@ -1626,51 +1777,58 @@ gantt
 #### 💻 Phase 7: Frontend Application Integration
 
 ##### **Step 11: Build Frontend Route RBAC Guards**
-* **11.1. Substeps:**
+
+- **11.1. Substeps:**
   1. Initialize the frontend React + Vite + TypeScript application inside the `frontend/` directory using: `npx -y create-vite@latest frontend --template react-ts` (run from the workspace root). Note: the correct package is `create-vite`, **not** the deprecated `create-vite-app`.
   2. Install dependencies: Zustand, TanStack Query, React Router v6, and setup testing libraries.
-  2. Implement authentication context capturing the signed-in user's roles and permissions.
-  3. Create the `RouteGuard` component to wrap all protected workspace paths.
-  4. Compare requested permissions against user roles. Return access authorization or route users to `/unauthorized` or `/login`.
+  3. Implement authentication context capturing the signed-in user's roles and permissions.
+  4. Create the `RouteGuard` component to wrap all protected workspace paths.
+  5. Compare requested permissions against user roles. Return access authorization or route users to `/unauthorized` or `/login`.
 
-* **11.2. Unit Testing & Mocking Strategy:**
-  * **Objective:** Ensure UI component routes render or redirect correctly based on auth status and permissions.
-  * **Test Setup:** Use React Testing Library and React Router hooks context.
-  * **Mock Details:** Mock the custom `useAuth` hook value.
-  * **Functions to Test:**
-    * `RouteGuard` component rendering.
-  * **Sample Mock Setup & Test Case:**
+- **11.2. Unit Testing & Mocking Strategy:**
+  - **Objective:** Ensure UI component routes render or redirect correctly based on auth status and permissions.
+  - **Test Setup:** Use React Testing Library and React Router hooks context.
+  - **Mock Details:** Mock the custom `useAuth` hook value.
+  - **Functions to Test:**
+    - `RouteGuard` component rendering.
+  - **Sample Mock Setup & Test Case:**
+
     ```tsx
-    import { render, screen } from '@testing-library/react';
-    import { MemoryRouter, Routes, Route } from 'react-router-dom';
-    import { RouteGuard } from './RouteGuard';
-    import * as useAuthHook from '../../hooks/useAuth';
+    import { render, screen } from "@testing-library/react";
+    import { MemoryRouter, Routes, Route } from "react-router-dom";
+    import { RouteGuard } from "./RouteGuard";
+    import * as useAuthHook from "../../hooks/useAuth";
 
-    jest.mock('../../hooks/useAuth');
+    jest.mock("../../hooks/useAuth");
 
-    test('RouteGuard redirects to unauthorized when user lacks permission', () => {
-        // Arrange
-        const mockUseAuth = useAuthHook as jest.MockedFunction<typeof useAuthHook.useAuth>;
-        mockUseAuth.mockReturnValue({
-            isAuthenticated: true,
-            user: { permissions: ['inventory:read'] } // Lacks 'users:manage'
-        });
+    test("RouteGuard redirects to unauthorized when user lacks permission", () => {
+      // Arrange
+      const mockUseAuth = useAuthHook as jest.MockedFunction<
+        typeof useAuthHook.useAuth
+      >;
+      mockUseAuth.mockReturnValue({
+        isAuthenticated: true,
+        user: { permissions: ["inventory:read"] }, // Lacks 'users:manage'
+      });
 
-        render(
-            <MemoryRouter initialEntries={['/admin-panel']}>
-                <Routes>
-                    <Route path="/admin-panel" element={
-                        <RouteGuard requiredPermission="users:manage">
-                            <div>Admin Area</div>
-                        </RouteGuard>
-                    } />
-                    <Route path="/unauthorized" element={<div>Access Denied</div>} />
-                </Routes>
-            </MemoryRouter>
-        );
+      render(
+        <MemoryRouter initialEntries={["/admin-panel"]}>
+          <Routes>
+            <Route
+              path="/admin-panel"
+              element={
+                <RouteGuard requiredPermission="users:manage">
+                  <div>Admin Area</div>
+                </RouteGuard>
+              }
+            />
+            <Route path="/unauthorized" element={<div>Access Denied</div>} />
+          </Routes>
+        </MemoryRouter>,
+      );
 
-        // Assert
-        expect(screen.getByText('Access Denied')).toBeInTheDocument();
-        expect(screen.queryByText('Admin Area')).not.toBeInTheDocument();
+      // Assert
+      expect(screen.getByText("Access Denied")).toBeInTheDocument();
+      expect(screen.queryByText("Admin Area")).not.toBeInTheDocument();
     });
     ```
