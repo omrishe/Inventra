@@ -44,7 +44,7 @@ The backend is structured into four distinct layers in line with Clean Architect
 
 ## 🗄️ 2. Database Schema (PostgreSQL)
 
-We will use PostgreSQL with Entity Framework Core. To handle product polymorphism, we implement **Table-Per-Type (TPT)**. To prevent race conditions during high-volume stock updates, we introduce a **Reservation** table and use PostgreSQL `xmin` system columns for optimistic concurrency.
+We will use PostgreSQL with Entity Framework Core. To handle product polymorphism, we implement **Table-Per-Type (TPT)**. To prevent race conditions during high-volume stock updates, we introduce a **Reservation** table and use PostgreSQL row locking (`SELECT FOR UPDATE`) for safe multi-step reservation flows, alongside `xmin` for optimistic concurrency on non-critical administrative edits.
 
 ```mermaid
 erDiagram
@@ -335,6 +335,31 @@ if (Guid.TryParse(userIdClaim, out var userId))
 > ⚠️ **Multi-Pod Caveat:** This cache is **in-process only**. In a horizontally scaled deployment (multiple pods), a revocation sent to Pod A is not automatically propagated to Pod B. For true distributed revocation, swap `IMemoryCache` for a **Redis-backed `IDistributedCache`**. For the current single-pod MVP, this is acceptable.
 
 ### Safe Concurrency & Reservation Engine
+
+#### Concurrency Strategy Framework
+
+Concurrency must be handled according to the following tier system:
+
+1. **Atomic conditional update (BEST default)**
+   - **Use when:** Single-row invariant, simple numeric/state constraint, no multi-step logic.
+   - **Example:** Inventory decrement, quota usage, balance deduction.
+   - **Note:** Use whenever possible (e.g., direct stock adjustments).
+
+2. **Row locking (SELECT FOR UPDATE)**
+   - **Use when:** You need multi-step logic on the same row, or multiple dependent reads before write.
+   - **Example:** Check stock + validate rules + insert reservation, pricing calculation before update.
+   - **Note:** Not a fallback — a different category.
+
+3. **Serializable transaction**
+   - **Use when:** Invariant spans multiple rows/tables, or complex read consistency is required.
+   - **Example:** "User cannot exceed global limit across tables", "No overlapping bookings across calendar range".
+   - **Note:** This is NOT weaker than row locking. It’s a different consistency model.
+
+4. **Optimistic concurrency**
+   - **Use when:** Conflicts are rare, operations are mostly independent, retries are acceptable.
+   - **Example:** Admin editing inventory, product metadata updates, non-critical counters.
+   - **Note:** Not a fallback — it’s a performance strategy.
+
 To prevent race conditions where two threads try to claim the same stock, we implement a reservation model that calculates **Available Quantity** dynamically and handles EF Core concurrency exceptions.
 
 * **Formula:**
@@ -342,7 +367,7 @@ To prevent race conditions where two threads try to claim the same stock, we imp
   
 * **Reservation Flow:**
   1. Begin Transaction with standard isolation level.
-  2. Query `InventoryItem` for (Store, Product). This includes the PostgreSQL `xmin` tracking token.
+  2. Query `InventoryItem` for (Store, Product) and apply Row Locking using a raw SQL query with `FOR UPDATE`. This prevents concurrent transactions from modifying the stock or securing their own locks on the same row until this transaction completes.
   3. Query active reservations:
      ```csharp
      var reservedQty = await _dbContext.Reservations
@@ -351,8 +376,8 @@ To prevent race conditions where two threads try to claim the same stock, we imp
          .SumAsync(r => r.Quantity);
      ```
   4. If `InventoryItem.Quantity - reservedQty >= requestedQty`, write a new `Reservation` record with status `Pending` and `ExpiresAt` (e.g., +15 mins).
-  5. Save Changes.
-  6. If a concurrent operation modified the `InventoryItem` (changing `xmin`), EF Core throws a `DbUpdateConcurrencyException`. The API catches this, rolls back, and retries the process (up to 3 times) or returns a `409 Conflict`.
+  5. Save Changes and Commit Transaction. The lock is released automatically.
+  6. If `InventoryItem.Quantity - reservedQty < requestedQty`, roll back the transaction and return a `409 Conflict` or `422 Unprocessable Entity` immediately. No retry loop is required since the read was strictly consistent via the row lock.
 
 * **Reservation Expiry Strategy — PostgreSQL `pg_cron`:**
   Expired reservations (`Status = 'Pending'` and `ExpiresAt < NOW()`) are cleaned up **directly inside the database** using the `pg_cron` extension. This removes any dependency on the API process being alive and eliminates the risk of multiple pods racing to perform cleanup.
@@ -1058,7 +1083,7 @@ gantt
      ```
   2. Create `AppDbContext` in the Infrastructure layer, inheriting from `DbContext`.
   3. Overwrite `OnModelCreating` to automatically apply the Multi-Tenant Global Query Filter to all entities implementing `ITenantEntity`.
-  4. Map the PostgreSQL `xmin` system column to the `InventoryItem` entity (the only entity requiring optimistic concurrency control) by configuring it as `.IsRowVersion()` in EF Core. Do **not** configure xmin on `Reservation` -- it adds model complexity for no benefit, since reservation conflicts are handled via the availability check and retry logic.
+  4. Map the PostgreSQL `xmin` system column to the `InventoryItem` entity for optimistic concurrency control (used for administrative edits). Do **not** configure xmin on `Reservation` -- it adds model complexity for no benefit, since reservation conflicts are handled via Row Locking (`SELECT FOR UPDATE`) during the reservation process.
   5. Run the initial EF Core migration using Entity Framework CLI: `dotnet ef migrations add InitialMigration --project Inventra.Infrastructure --startup-project Inventra.API`.
 
 * **2.2. Unit Testing & Mocking Strategy:**
@@ -1402,17 +1427,15 @@ gantt
     }
     ```
 
-##### **Step 8: Build Concurrency Retry Mechanism for Inventory Updates**
+##### **Step 8: Implement Row Locking for Reservation Engine**
 * **8.1. Substeps:**
-  1. Implement stock updates wrapped inside a handler catch-block targeting `DbUpdateConcurrencyException`.
-  2. Implement an automatic retry mechanism:
-     - On concurrency exception (thrown when `xmin` value doesn't match the database value), reload the `InventoryItem` record.
-     - Re-evaluate the dynamic reservation check.
-     - If sufficient stock is still available, attempt the save again (up to 3 times).
-     - If retry limit is reached, abort, roll back transaction, and throw a `409 ConflictException`.
+  1. Implement the stock availability check using a raw SQL transaction with `SELECT FOR UPDATE` to lock the `InventoryItem` row.
+  2. Calculate the dynamic reservation quantity while the row lock is held.
+  3. If sufficient stock is available, insert the reservation and commit to release the lock.
+  4. If stock is insufficient, abort the transaction and throw a `409 ConflictException` (no retry loop is needed).
 
 * **8.2. Unit Testing & Mocking Strategy:**
-  * **Objective:** Test that the system successfully retries on conflicts and raises an exception only when the retry limit is exhausted.
+  * **Objective:** Test that the system successfully prevents overselling by rejecting the reservation if stock is exhausted, verifying the transaction boundary.
   * **Test Setup:** Mock a DbContext instance configured to throw concurrency exceptions during `SaveChangesAsync`.
   * **Mock Details:** Setup dynamic Mock returns utilizing callbacks to mock changes to database records.
   * **Functions to Test:**
