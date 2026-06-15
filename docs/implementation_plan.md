@@ -15,6 +15,7 @@ This document outlines the complete architectural design and implementation plan
   * A **Store Employee/Manager** has a non-null `StoreId` and can only view/interact with inventory associated with their specific store.
 
 > ⚠️ **ChainId Enforcement Rule:** Every entity that stores tenant data **must** implement `ITenantEntity` and carry a `ChainId` column. EF Core Global Query Filters are applied automatically to all `ITenantEntity` types. Any new entity added to the domain that omits `ChainId` will bypass the tenancy filter entirely and **must be treated as a critical bug**. This is enforced at the `AppDbContext` level and verified by integration tests.
+> **Intentional exceptions:** `InventoryItem`, `Reservation`, and `StockMovement` deliberately do **not** implement `ITenantEntity`. Tenant isolation for these entities is enforced via an explicit join predicate (`Store.ChainId == tenantContext.ChainId`) on every query. This is a documented architectural decision, not a bug.
 
 ### Clean Architecture Layers
 The backend is structured into four distinct layers in line with Clean Architecture:
@@ -233,7 +234,7 @@ CREATE TABLE "Reservations" (
     "Quantity" INT NOT NULL,
     "Status" VARCHAR(20) NOT NULL, -- 'Pending', 'Completed', 'Cancelled', 'Expired'
     "ExpiresAt" TIMESTAMP WITH TIME ZONE NOT NULL,
-    "CreatedByUserId" UUID REFERENCES "Users"("Id") ON DELETE SET NULL,
+    "CreatedByUserId" UUID REFERENCES "Users"("Id") ON DELETE RESTRICT, -- Users are soft-deleted via IsDeleted; hard deletion is blocked by RESTRICT as a safety net
     "CreatedAt" TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 ```
@@ -302,6 +303,11 @@ Each authenticated request carries `ChainId` (and optionally `StoreId`) encoded 
        // Apply multi-tenancy filter to all entities implementing ITenantEntity
        foreach (var entityType in modelBuilder.Model.GetEntityTypes())
        {
+           // ⚠️ TPT GUARD: Skip derived types — EF Core throws if HasQueryFilter is applied
+           // to a non-root type. The filter on the root entity (e.g. Product) propagates
+           // automatically to PhysicalProduct and PerishableProduct via the TPT JOIN.
+           if (entityType.BaseType != null) continue;
+
            if (typeof(ITenantEntity).IsAssignableFrom(entityType.ClrType))
            {
                modelBuilder.Entity(entityType.ClrType)
@@ -310,6 +316,7 @@ Each authenticated request carries `ChainId` (and optionally `StoreId`) encoded 
        }
    }
    ```
+   > ⚠️ **Scoping note:** `InventoryItem`, `Reservation`, and `StockMovement` do **not** implement `ITenantEntity` and carry no `ChainId` column. Tenant isolation for these entities is enforced manually via a join predicate: `i.Store.ChainId == tenantContext.ChainId`. Every query against these entities **must** include this join — there is no automatic EF filter as a safety net.
 
 ### Role Revocation Blacklist (In-Memory Cache)
 
@@ -466,10 +473,11 @@ To prevent race conditions where two threads try to claim the same stock, we imp
   * `401 Unauthorized` — token has been revoked (session invalidated by admin)
 
 #### `POST /api/v1/auth/logout`
-* **Description:** Revoke the current refresh token, effectively ending the session. Future refresh attempts with this token will return 401.
-* **Auth:** Bearer Token
-* **Request Schema:** `{ "refreshToken": "<token>" }`
+* **Description:** Revoke the current refresh token cookie, effectively ending the session. The server reads the `refreshToken` HttpOnly cookie, marks the token as revoked, and deletes the cookie. Future refresh attempts will return 401.
+* **Auth:** Bearer Token (optional — session is identified by the `refreshToken` cookie, not the access token body)
+* **Request Schema:** *(no body — refresh token is read from the `refreshToken` HttpOnly cookie)*
 * **Response Schema:** `204 No Content`
+  * On success, the server calls `Response.Cookies.Delete("refreshToken")` to clear the cookie.
 
 #### `GET /api/v1/auth/me`
 * **Description:** Retrieve current authenticated user session detail including effective permissions (union of role-based + direct grants).
@@ -594,19 +602,20 @@ To prevent race conditions where two threads try to claim the same stock, we imp
 * **Description:** Create a product. Supports Physical, Perishable, and Digital configurations mapping directly to TPT entities.
 * **Auth:** Permissions: `products:write`
 * **Request Schema (`CreateProductRequest`):**
+  > ℹ️ **Flat DTO (no nested spec objects):** All sub-type fields are top-level on the request. Fields not applicable to the chosen `productType` must be `null`.
 ```json
 {
   "name": "Fresh Organic Milk",
   "sku": "MILK-ORG-01",
   "description": "1 Gallon Pasteurized Milk",
   "price": 4.99,
-  "type": "Perishable",
-  "perishableSpecs": {
-    "expiryDate": "2026-06-15T00:00:00Z",
-    "storageTemperature": 4.0
-  }
+  "productType": "Perishable",
+  "storageTemperature": 4.0,
+  "weightKg": null,
+  "dimensions": null
 }
 ```
+  > ⚠️ `ExpiryDate` is **not** a product-level field. Expiry is a batch property captured on `PurchaseOrderItem.ExpiryDate` at receipt time. `PerishableProduct` stores only `StorageTemperature` (decimal °C).
 * **Response Schema:** `201 Created`
 ```json
 {
@@ -666,6 +675,19 @@ To prevent race conditions where two threads try to claim the same stock, we imp
   "totalCount": 1,
   "page": 1,
   "pageSize": 25
+}
+```
+
+#### `GET /api/v1/inventory/summary`
+* **Description:** Retrieve high-level stock statistics (total product lines and low-stock alerts count) for the dashboard. ChainAdmins can scope this to a specific store via `?storeId=`; store-scoped users always receive stats for their assigned store.
+* **Auth:** Permissions: `inventory:read`
+* **Query Parameters:**
+  * `storeId` (UUID, optional — **ChainAdmin only**; ignored and overridden by JWT claim for store-scoped users)
+* **Response Schema:** `200 OK`
+```json
+{
+  "totalProductLines": 150,
+  "lowStockCount": 12
 }
 ```
 
@@ -953,20 +975,30 @@ import { useAuth } from '../hooks/useAuth';
 
 interface RouteGuardProps {
   requiredPermission?: string;
+  storeScope?: boolean; // When true, enforces that non-ChainAdmin users can only access their own storeId
   children: React.ReactNode;
 }
 
-export const RouteGuard: React.FC<RouteGuardProps> = ({ requiredPermission, children }) => {
-  const { isAuthenticated, user } = useAuth();
-  
+export const RouteGuard: React.FC<RouteGuardProps> = ({ requiredPermission, storeScope, children }) => {
+  const { isAuthenticated, isChainAdmin, hasPermission, storeId: jwtStoreId } = useAuth();
+  const { storeId: paramStoreId } = useParams();
+  const navigate = useNavigate();
+
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />;
   }
 
-  // Allow access if user holds required permission or wildcard '*' super-admin permission
-  if (requiredPermission && !user?.permissions.includes(requiredPermission) && !user?.permissions.includes('*')) {
+  // Check required permission using the hasPermission helper (handles wildcard '*')
+  if (requiredPermission && !hasPermission(requiredPermission)) {
     return <Navigate to="/unauthorized" replace />;
   }
+
+  // Store-scope guard: non-ChainAdmin users may only access their own store's URL
+  useEffect(() => {
+    if (storeScope && !isChainAdmin && paramStoreId && paramStoreId !== jwtStoreId) {
+      navigate(`/inventory/${jwtStoreId}`, { replace: true });
+    }
+  }, [storeScope, isChainAdmin, paramStoreId, jwtStoreId, navigate]);
 
   return <>{children}</>;
 };
@@ -1370,13 +1402,15 @@ gantt
         using var context = new AppDbContext(options, mockTenantContext.Object);
         
         // Setup inventory count = 100
-        context.InventoryItems.Add(new InventoryItem { StoreId = storeId, ProductId = productId, Quantity = 100, ChainId = tenantId });
+        // Note: InventoryItem has NO ChainId — isolation is via Store.ChainId join, not ITenantEntity
+        context.InventoryItems.Add(new InventoryItem { StoreId = storeId, ProductId = productId, Quantity = 100 });
         
         // Active reservation: 15
-        context.Reservations.Add(new Reservation { StoreId = storeId, ProductId = productId, Quantity = 15, Status = "Pending", ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(15), ChainId = tenantId });
+        // Note: Reservation has NO ChainId — isolation is via Store.ChainId join, not ITenantEntity
+        context.Reservations.Add(new Reservation { StoreId = storeId, ProductId = productId, Quantity = 15, Status = ReservationStatus.Pending, ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(15) });
         
         // Expired reservation: 20
-        context.Reservations.Add(new Reservation { StoreId = storeId, ProductId = productId, Quantity = 20, Status = "Pending", ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-10), ChainId = tenantId });
+        context.Reservations.Add(new Reservation { StoreId = storeId, ProductId = productId, Quantity = 20, Status = ReservationStatus.Pending, ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-10) });
 
         await context.SaveChangesAsync();
 
@@ -1433,7 +1467,9 @@ gantt
     }
     ```
 
-##### **Step 9: Schedule Reservation Expiry via `pg_cron` Data Migration**
+##### **Step 9: Schedule Reservation Expiry via `pg_cron` Data Migration** *(Post-MVP — Full Deployment Only)*
+
+> 🚫 **MVP NOTE:** This step is **deferred** in the MVP. The MVP uses a dotnet `BackgroundService` (`ReservationCleanupWorker`) instead — see `mvp_implementation_plan.md` Step 4.3. `pg_cron` requires PostgreSQL superuser access and a compatible host (Supabase / AWS RDS). Implement Step 9 only when moving to a production PostgreSQL host that supports the extension.
 * **9.1. Substeps:**
   1. Enable the `pg_cron` extension on the PostgreSQL server (run once by a superuser / DBA script):
      ```sql
@@ -1486,13 +1522,14 @@ gantt
         var storeId = Guid.NewGuid();
         var productId = Guid.NewGuid();
 
+        // Note: Reservation has NO ChainId — isolation via Store.ChainId join, not ITenantEntity
         context.Reservations.AddRange(
-            new Reservation { ChainId = tenantId, StoreId = storeId, ProductId = productId,
-                Quantity = 5, Status = "Pending", ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-5) }, // EXPIRED
-            new Reservation { ChainId = tenantId, StoreId = storeId, ProductId = productId,
-                Quantity = 5, Status = "Pending", ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(15) }, // ACTIVE
-            new Reservation { ChainId = tenantId, StoreId = storeId, ProductId = productId,
-                Quantity = 5, Status = "Completed", ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-5) }  // ALREADY DONE
+            new Reservation { StoreId = storeId, ProductId = productId,
+                Quantity = 5, Status = ReservationStatus.Pending, ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-5) }, // EXPIRED
+            new Reservation { StoreId = storeId, ProductId = productId,
+                Quantity = 5, Status = ReservationStatus.Pending, ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(15) }, // ACTIVE
+            new Reservation { StoreId = storeId, ProductId = productId,
+                Quantity = 5, Status = ReservationStatus.Completed, ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-5) }  // ALREADY DONE
         );
         await context.SaveChangesAsync();
 

@@ -62,7 +62,10 @@ The objective of this phase is to establish the Clean Architecture solution and 
 2. Define the core tenant entities: `Chain` (ID, Name, PlanType) and `Store` (ID, ChainId, Name, Location).
 3. Implement `AppDbContext` and wire the `OnModelCreating` configuration:
    * Automatically apply a Global Query Filter to all entities implementing `ITenantEntity` using the active `ChainId` from `ITenantContext`.
+   * **TPT Guard:** The filter loop must skip derived entity types (`if (entityType.BaseType != null) continue;`). EF Core throws `InvalidOperationException` if `HasQueryFilter` is applied to a non-root TPT type. The root entity filter propagates automatically to sub-types via the EF TPT JOIN.
+   * **Scoping note:** `InventoryItem`, `Reservation`, and `StockMovement` do **not** implement `ITenantEntity` (no `ChainId` column). Tenant isolation for these entities is enforced manually with a join predicate (`i.Store.ChainId == tenantContext.ChainId`) on every query — there is no EF auto-filter fallback.
    * Configure the PostgreSQL `xmin` system column to act as a concurrency token for the `InventoryItem` entity.
+   * **Inventory Bootstrapping (Seed Script):** After migration, a seed script pre-creates `InventoryItem` rows with `Quantity = 0` for every `(StoreId, ProductId)` combination. This means `AdjustStock` can always assume the row exists and will return `404` only for genuinely unknown combinations (not for "first stock entry" scenarios).
 4. Generate the initial EF Core migration: `dotnet ef migrations add InitialMigration`.
 
 #### **Step 1.3: Tenancy Context Extraction Middleware**
@@ -127,7 +130,7 @@ The objective of this phase is to build the core inventory engine, protect again
 4. Create `InventoryService` with:
    * `AdjustStock`: Verifies the `InventoryItem` exists (returns `404` if not), applies the signed delta, writes a `StockMovement` audit record, and saves atomically.
    * `GetInventoryLevels`: Filters by `Store.ChainId == tenantContext.ChainId`, then by `StoreId` if the caller is store-scoped. Returns physical, reserved, and available quantity per item.
-5. Expose `GET /api/v1/inventory` (`inventory:read`) and `POST /api/v1/inventory/adjust` (`inventory:adjust`).
+5. Expose `GET /api/v1/inventory` (`inventory:read`), `GET /api/v1/inventory/summary` (`inventory:read`), and `POST /api/v1/inventory/adjust` (`inventory:adjust`).
 
 #### **Step 4.2: Reservation Engine & Concurrency Control**
 1. Create the `Reservation` entity (`StoreId`, `ProductId`, `Quantity`, `Status` [Pending/Completed/Expired], `ExpiresAt`). **No `ChainId` column** — isolation via `Store.ChainId`.
@@ -143,6 +146,8 @@ The objective of this phase is to build the core inventory engine, protect again
 1. Implement a `BackgroundService` (`ReservationCleanupWorker`) in the WebAPI project — triggers every 60 seconds.
 2. Under a scoped lifetime, resolve `AppDbContext` and execute a parameterized SQL command:
    `UPDATE "Reservations" SET "Status" = 'Expired' WHERE "Status" = 'Pending' AND "ExpiresAt" < {utcNow}`.
+
+> 🚫 **pg_cron is NOT used in the MVP.** `pg_cron` requires PostgreSQL superuser access and a compatible host. The `BackgroundService` approach keeps the application host-agnostic. pg_cron is documented in `implementation_plan.md` Step 9 as a post-MVP upgrade path for production deployments.
 
 ---
 
@@ -172,12 +177,12 @@ The objective of this phase is to construct the user interface and integrate it 
 
 #### **Step 5.2: Auth Shell & Guards**
 1. Create the Zustand `useAuthStore` to hold the in-memory JWT, email, role, permissions, `userId`, `chainId`, and `storeId`. No persistence — token is re-hydrated on page load via a silent refresh.
-2. Implement a silent-refresh bootstrap: on app mount (`App.tsx`), call `POST /api/v1/auth/refresh`. On success, populate the Zustand store with the new token and user identity. On failure (cookie expired/absent), leave the store empty and show the login page.
+2. Implement a silent-refresh bootstrap: on app mount (`App.tsx`), track an `isHydrating: boolean` state (initially `true`). While `isHydrating` is `true`, render a full-screen spinner (centered logo + subtle animation). Call `POST /api/v1/auth/refresh` with a 5-second Axios timeout. On success, populate the Zustand store with the new token and user identity, then set `isHydrating = false`. On failure (cookie expired/absent or timeout), set `isHydrating = false` and leave the store empty — `RouteGuard` redirects to `/login`.
 3. Build the `Login` and `RegisterCompany` pages using `react-hook-form` + `zod` for form validation and TanStack Query `useMutation` for API calls.
-4. Build the `RouteGuard` component: checks `isAuthenticated` from `useAuthStore` (redirects to `/login` if false) and optionally checks a required permission string (redirects to `/unauthorized` if missing).
+4. Build the `RouteGuard` component: checks `isAuthenticated` from `useAuthStore` (redirects to `/login` if false), optionally checks a required permission string (redirects to `/unauthorized` if missing), and optionally enforces store-scoping via a `storeScope` prop. When `storeScope` is `true`, `RouteGuard` reads `storeId` from `useParams()` and, if the caller is not a ChainAdmin and the param does not match their JWT `storeId`, immediately replaces the URL with `/inventory/:jwtStoreId`.
 
 #### **Step 5.3: Pages & Forms**
-1. **Dashboard Page:** Displays key stats (total items, low-stock alerts) fetched via TanStack Query `useQuery`.
+1. **Dashboard Page:** Displays key stats (total product lines, low-stock alerts) fetched via TanStack Query `useQuery` from the dedicated `GET /api/v1/inventory/summary` endpoint. The Dashboard must pass an optional `storeId` parameter (e.g., matching a globally selected store or defaulting correctly) so that ChainAdmins see accurately scoped store-level stats instead of chain-wide aggregates.
 2. **Product Catalog Page:** Table view listing products (fetched via `useQuery`), with a modal form to create a product:
    - Product type selection (Physical / Perishable) drives conditional field visibility via `react-hook-form` `watch`.
    - A `zod` discriminated union schema validates sub-type-specific required fields on the frontend before submitting.
@@ -186,10 +191,11 @@ The objective of this phase is to construct the user interface and integrate it 
 3. **Inventory Management Page** (`/inventory/:storeId`):
    - Reads `storeId` from `useParams()`.
    - Fetches inventory via `useQuery({ queryKey: ['inventory', storeId], queryFn: () => fetchInventory(storeId) })`.
-   - For a **ChainAdmin** navigating to `/inventory` with no `storeId`, auto-redirect to `/inventory/<first-store-id>` using the first result from the stores list.
-   - For **store-scoped users** (StoreManager / StoreEmployee), always redirect to `/inventory/<jwt-storeId>`; navigation to any other store's URL is blocked by `RouteGuard`.
+   - For a **ChainAdmin** navigating to `/inventory` with no `storeId`, auto-redirect to `/inventory/<first-store-id>` using the first result from the stores list. If the stores list is empty, redirect to `/stores` with a setup banner: *"You have no stores yet. Create your first store to start tracking inventory."*
+   - For **store-scoped users** (StoreManager / StoreEmployee), `RouteGuard` (with `storeScope` prop) intercepts any URL mismatch and redirects to `/inventory/<jwt-storeId>` — no logic needed inside `StockControl.tsx`.
    - The Topbar store picker (visible to ChainAdmin only) calls `navigate('/inventory/' + newStoreId)` on selection.
-   - The stock adjustment modal uses a `MovementType` dropdown with human-readable labels (`Stock Receipt`, `Stock Removal`, `Manual Adjustment`) mapped to the backend enum values (`In`, `Out`, `Adjustment`). A `zod` rule validates that the delta sign matches the selected movement type.
+   - The stock adjustment modal uses a `MovementType` dropdown with human-readable labels (`Stock Receipt`, `Stock Removal`, `Manual Adjustment`) mapped to the backend **PascalCase enum values** (`In`, `Out`, `Adjustment`). A `zod` rule validates that the delta sign matches the selected movement type.
+   > ⚠️ **`MovementType` casing:** The C# enum is `In`, `Out`, `Adjustment` (PascalCase). JSON serialization uses PascalCase strings. Do **not** use ALL_CAPS (`IN`, `OUT`). All backend services, test assertions, and frontend mappings must use PascalCase.
 
 ---
 
@@ -286,11 +292,17 @@ The following decisions have been finalized and are locked in for the developmen
 1. **Static Roles & Permissions:** Dynamic RBAC tables and dynamic role management UI are deferred. Static roles (`ChainAdmin`, `StoreManager`, `StoreEmployee`) are implemented in code with pre-defined permission scopes.
 2. **Physical & Perishable Focus:** Digital products are deferred; polymorphic schema and CRUD operations support base Product, Physical, and Perishable types only.
 3. **Direct Stock Adjustments:** Suppliers registry and Purchase Order workflows are deferred. Initial stock counts and edits are managed through direct adjustments.
-4. **Dotnet-Native Background Service:** A dotnet `BackgroundService` is selected over database-specific `pg_cron` dependencies to keep the application host-agnostic. It runs a scheduled task every 60 seconds to update expired reservation records.
-5. **Token Storage — In-Memory JWT + HttpOnly Cookie:** The access JWT is stored in Zustand (in-memory only, cleared on refresh). The refresh token is delivered and stored as an `HttpOnly`/`Secure`/`SameSite=Strict` cookie — never accessible from JavaScript. On page load, a silent `POST /api/v1/auth/refresh` re-hydrates the Zustand store using the cookie automatically sent by the browser.
+   > ✅ **Inventory Bootstrapping (Seed Script):** A seed script pre-creates `InventoryItem` rows at `Quantity = 0` for every `(StoreId, ProductId)` combination after migration. `AdjustStock` returns `404` only for unknown combinations — not for "first stock entry" situations. No initialization endpoint is needed.
+4. **Dotnet-Native Background Service:** A dotnet `BackgroundService` is selected over database-specific `pg_cron` dependencies to keep the application host-agnostic. It runs a scheduled task every 60 seconds to update expired reservation records. pg_cron is documented as a post-MVP upgrade path only.
+5. **Token Storage — In-Memory JWT + HttpOnly Cookie:** The access JWT is stored in Zustand (in-memory only, cleared on refresh). The refresh token is delivered and stored as an `HttpOnly`/`Secure`/`SameSite=Strict` cookie — never accessible from JavaScript. On page load, `App.tsx` tracks an `isHydrating` state that renders a full-screen spinner while `POST /api/v1/auth/refresh` completes (5-second timeout). On success, the Zustand store is populated and the spinner is dismissed. On failure, `isHydrating` is cleared and `RouteGuard` redirects to `/login`.
 6. **Axios Singleton Refresh Pattern:** The Axios response interceptor in `apiClient.ts` uses a module-level in-flight promise to ensure that multiple concurrent 401 responses trigger exactly one `POST /api/v1/auth/refresh` call. All other expired requests queue and retry with the new token once the refresh resolves.
-7. **Inventory URL-Scoped Routing:** The Inventory Management page route is `/inventory/:storeId`. The `storeId` path param drives both the TanStack Query cache key (`['inventory', storeId]`) and the optional `?storeId=` filter sent to `GET /api/v1/inventory`. ChainAdmins default to the first store in their list; store-scoped users are locked to their own store.
+7. **Inventory URL-Scoped Routing:** The Inventory Management page route is `/inventory/:storeId`. The `storeId` path param drives both the TanStack Query cache key (`['inventory', storeId]`) and the optional `?storeId=` filter sent to `GET /api/v1/inventory`. ChainAdmins default to the first store in their list; if no stores exist they are redirected to `/stores` with a setup banner. Store-scoped users are locked to their own store by `RouteGuard`.
 8. **Form Validation — `react-hook-form` + `zod`:** All forms (login, register, create product, adjust stock) use `react-hook-form` with `zod` resolver. Polymorphic product creation uses a `zod` discriminated union on `productType` to conditionally validate sub-type fields client-side. Backend validation remains the authoritative gate; backend 400 errors surface as form-level banners.
 9. **Extended `AuthResponse`:** The `AuthResponse` DTO is extended to include `UserId`, `ChainId`, and `StoreId` so the frontend does not need to decode the JWT. `StoreId` is `null` for `ChainAdmin` users.
 10. **CORS with Credentials:** A named CORS policy (`FrontendDev`) is registered in `Program.cs` allowing `http://localhost:5173` with `AllowCredentials()`. This is required for the HttpOnly cookie to be transmitted on cross-origin requests during local development.
-11. **`MovementType` Explicit Dropdown:** The stock adjustment form exposes a required `MovementType` dropdown with human-readable labels (`Stock Receipt`, `Stock Removal`, `Manual Adjustment`) to preserve semantic fidelity in the `StockMovements` audit ledger. A `zod` rule enforces that the delta sign is consistent with the selected type.
+11. **`MovementType` Explicit Dropdown (PascalCase enum):** The stock adjustment form exposes a required `MovementType` dropdown with human-readable labels (`Stock Receipt`, `Stock Removal`, `Manual Adjustment`). The backend C# enum uses **PascalCase**: `In`, `Out`, `Adjustment` — serialized as PascalCase JSON strings. A `zod` rule enforces that the delta sign is consistent with the selected type.
+12. **`InventoryItem`, `Reservation`, `StockMovement` — No `ChainId`:** These three entities do not implement `ITenantEntity` and have no `ChainId` column. Tenant isolation is enforced via explicit join predicates (`Store.ChainId == tenantContext.ChainId`) on every query. The EF Global Query Filter does NOT apply to them.
+13. **`CreatedByUserId` FK — `RESTRICT` delete:** `StockMovement.CreatedByUserId` and `Reservation.CreatedByUserId` use `ON DELETE RESTRICT`. Users are soft-deleted via `IsDeleted = true` — hard deletion is blocked by `RESTRICT` as a safety net to preserve audit history.
+14. **`StorageTemperature` type — `decimal`:** `PerishableProduct.StorageTemperature` is a `decimal` number (°C), not a string. API request/response uses `4.0`, not `"2-8°C"`. The SQL column is `DECIMAL(5,2)`.
+15. **`RouteGuard` — `storeScope` prop:** `RouteGuard` accepts an optional boolean `storeScope` prop. When `true`, it reads `storeId` from `useParams()` and redirects non-ChainAdmin users to `/inventory/:jwtStoreId` if the param doesn’t match their JWT claim. This centralizes store-lock enforcement for all current and future store-scoped routes.
+16. **`useAuth` Hook — Full Helper Set:** `hooks/useAuth.ts` wraps `useAuthStore` and exposes computed properties: `isAuthenticated` (`!!token`), `isChainAdmin` (`role === 'ChainAdmin'`), and `hasPermission(p: string)` (checks `permissions.includes(p) || permissions.includes('*')`). Components use `useAuth()` as the single entry point; direct store access is reserved for non-React contexts (e.g., the Axios interceptor).
