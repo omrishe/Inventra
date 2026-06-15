@@ -44,7 +44,7 @@ The backend is structured into four distinct layers in line with Clean Architect
 
 ## 🗄️ 2. Database Schema (PostgreSQL)
 
-We will use PostgreSQL with Entity Framework Core. To handle product polymorphism, we implement **Table-Per-Type (TPT)**. To prevent race conditions during high-volume stock updates, we introduce a **Reservation** table and use PostgreSQL row locking (`SELECT FOR UPDATE`) for safe multi-step reservation flows, alongside `xmin` for optimistic concurrency on non-critical administrative edits.
+We will use PostgreSQL with Entity Framework Core. To handle product polymorphism, we implement **Table-Per-Type (TPT)**. To prevent race conditions during high-volume stock updates, we introduce a **Reservation** table and use Row locking for safe multi-step reservation flows, alongside `xmin` for optimistic concurrency on non-critical administrative edits.
 
 ```mermaid
 erDiagram
@@ -345,7 +345,7 @@ Concurrency must be handled according to the following tier system:
    - **Example:** Inventory decrement, quota usage, balance deduction.
    - **Note:** Use whenever possible (e.g., direct stock adjustments).
 
-2. **Row locking (SELECT FOR UPDATE)**
+2. **Row locking**
    - **Use when:** You need multi-step logic on the same row, or multiple dependent reads before write.
    - **Example:** Check stock + validate rules + insert reservation, pricing calculation before update.
    - **Note:** Not a fallback — a different category.
@@ -1083,7 +1083,7 @@ gantt
      ```
   2. Create `AppDbContext` in the Infrastructure layer, inheriting from `DbContext`.
   3. Overwrite `OnModelCreating` to automatically apply the Multi-Tenant Global Query Filter to all entities implementing `ITenantEntity`.
-  4. Map the PostgreSQL `xmin` system column to the `InventoryItem` entity for optimistic concurrency control (used for administrative edits). Do **not** configure xmin on `Reservation` -- it adds model complexity for no benefit, since reservation conflicts are handled via Row Locking (`SELECT FOR UPDATE`) during the reservation process.
+  4. Map the PostgreSQL `xmin` system column to the `InventoryItem` entity for optimistic concurrency control (used for administrative edits). Do **not** configure xmin on `Reservation` -- it adds model complexity for no benefit, since reservation conflicts are handled via Row locking during the reservation process.
   5. Run the initial EF Core migration using Entity Framework CLI: `dotnet ef migrations add InitialMigration --project Inventra.Infrastructure --startup-project Inventra.API`.
 
 * **2.2. Unit Testing & Mocking Strategy:**
@@ -1429,7 +1429,7 @@ gantt
 
 ##### **Step 8: Implement Row Locking for Reservation Engine**
 * **8.1. Substeps:**
-  1. Implement the stock availability check using a raw SQL transaction with `SELECT FOR UPDATE` to lock the `InventoryItem` row.
+  1. Implement the stock availability check using Row locking to lock the `InventoryItem` row.
   2. Calculate the dynamic reservation quantity while the row lock is held.
   3. If sufficient stock is available, insert the reservation and commit to release the lock.
   4. If stock is insufficient, abort the transaction and throw a `409 ConflictException` (no retry loop is needed).

@@ -14,7 +14,7 @@ To deliver a working system efficiently, the scope is focused on core value: ten
 - **Authentication & Permissions:** JWT authentication (15 min) + token refresh (7 days, Data Protection API). Roles are static enums (`ChainAdmin`, `StoreManager`, `StoreEmployee`) that define a user's identity and their default permissions. Backend only checks the explicit permissions embedded in the JWT.
 - **Product Catalog:** TPT (Table-Per-Type) polymorphism supporting **Physical** and **Perishable** products (Digital products deferred).
 - **Inventory Tracking:** Store-level stock counts with `StockMovements` ledger.
-- **Basic Reservations:** Active reservations check, safe row locking (`SELECT FOR UPDATE`), and a simplified cleanup query for expired reservations.
+- **Basic Reservations:** Active reservations check, safe Row locking, and a simplified cleanup query for expired reservations.
 - **Frontend SPA (React/Vite):** Core dashboard, login/registration, product view, and stock level adjustment forms.
 
 ### 🟥 Out of Scope (Deferred)
@@ -162,7 +162,7 @@ Concurrency must be handled according to the following tier system:
    - **Example:** Inventory decrement, quota usage, balance deduction.
    - **Note:** Use whenever possible (e.g., direct stock adjustments).
 
-2. **Row locking (SELECT FOR UPDATE)**
+2. **Row locking**
    - **Use when:** You need multi-step logic on the same row, or multiple dependent reads before write.
    - **Example:** Check stock + validate rules + insert reservation, pricing calculation before update.
    - **Note:** Not a fallback — a different category.
@@ -180,7 +180,7 @@ Concurrency must be handled according to the following tier system:
 #### **Step 4.1: Stock Management & Movements Ledger**
 
 1. Add `IsDeleted bool` to the `User` entity (soft-delete; users are never hard-deleted).
-2. Create the `InventoryItem` entity (`StoreId`, `ProductId`, `Quantity`). **No `ChainId` column** — chain isolation enforced via `InventoryItem.StoreId → Store.ChainId` join. The PostgreSQL `xmin` system column is mapped as the concurrency token; it updates automatically on any row write — no explicit `UpdatedAt` column is needed.
+2. Create the `InventoryItem` entity (`StoreId`, `ProductId`, `Quantity`). **No `ChainId` column** — chain isolation enforced via `InventoryItem.StoreId → Store.ChainId` join. The PostgreSQL `xmin` system column is mapped as the concurrency token; keep the `UpdatedAt` column for future UI purposes.
 3. Create the `StockMovement` ledger entity (`StoreId`, `ProductId`, `Type` [In/Out/Adjustment], `Quantity`, `Reason`, `CreatedByUserId`).
 4. Create `InventoryService` with:
    - `AdjustStock`: Verifies the `InventoryItem` exists (returns `404` if not), applies the signed delta, writes a `StockMovement` audit record, and saves atomically.
@@ -193,7 +193,7 @@ Concurrency must be handled according to the following tier system:
 2. Implement `ReservationService.CreateReservationAsync`:
    $$\text{Available Stock} = \text{InventoryItem.Quantity} - \sum \text{Active Reservations}$$
 3. Implement `POST /api/v1/inventory/reserve` wrapping the operation in an EF Core transaction:
-   - Lock the `InventoryItem` row using a raw SQL query with `SELECT FOR UPDATE` to prevent concurrent modifications.
+   - Lock the `InventoryItem` row using Row locking to prevent concurrent modifications.
    - Query active reservations and calculate available quantity.
    - Caller supplies `LifetimeMinutes`; service caps it at `Inventory:MaxReservationLifetimeMinutes` from config.
    - If stock is sufficient, insert a `Pending` reservation.
